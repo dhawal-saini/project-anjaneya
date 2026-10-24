@@ -1,0 +1,92 @@
+# ===========================================================================
+# ANJANEYA - option universe (which contracts ANJANEYA-CAPTURE subscribes to)
+# ===========================================================================
+# Contract identity is ALWAYS (underlying, expiry, strike, option_type).
+# Indicators/features must never be computed across different contracts.
+# ===========================================================================
+
+underlying: NIFTY
+exchange: NFO
+currency: INR
+
+instrument:
+  # NSE F&O lot size for NIFTY - used only for reporting / cost maths.
+  # Not used for feature computation in Phase 1.
+  lot_size: 75
+  # Strike spacing for NIFTY options.
+  strike_interval: 50
+
+# Strike offsets relative to the ATM strike at subscription time.
+# Widened from the Phase-1 default (ATM-100, ATM, ATM+100) to five strikes per
+# option type, so an intraday move does not immediately push the captured set
+# off the money. The capture universe is a ONE-WAY DOOR: only the contracts
+# subscribed *during* a session are captured, and Kite does not serve historical
+# expired options, so widening this after a session cannot add to that day's
+# history. Decide the universe before the first session.
+strikes_offset: [-200, -100, 0, 100, 200]
+
+# Which expiries to capture. ANJANEYA accumulates its own option history, so we
+# capture the current week and the next week (rollover visibility) *and* the
+# current month, so a monthly-contract series exists before its expiry week.
+expiries:
+  - current_week
+  - next_week
+  - current_month
+
+atm:
+  # How ATM is defined: spot NIFTY vs the near-month NIFTY future.
+  # `spot` prices the index ("NIFTY 50"), `futures` the contract named by
+  # reference_instruments.nifty_futures.expiry_selector below. Capture prices the
+  # chosen instrument for the universe *and* watches its live ticks, so an
+  # intraday re-centre uses the same reference the ATM was placed from; the engine
+  # reports the same choice in `--mode universe` (from stored data). With
+  # `futures`, a master holding no futures contract is a hard error - snapping a
+  # spot price while this says "futures" would mis-place the whole universe.
+  reference: spot
+  # nearest | floor | ceil  - how to snap the reference price to a strike.
+  # `nearest` is floor(price / interval + 0.5): an exact midpoint rounds UP.
+  rounding: nearest
+
+# Symbol templates. NSE changes these formats from time to time, so they are
+# configurable rather than hard-coded.
+symbol_templates:
+  weekly: "NIFTY{expiry_short}{strike}{option_type}"
+  monthly: "NIFTY{expiry_short}{strike}{option_type}"
+  # Two/three letter month codes used in the `expiry_short` field for monthlies.
+  monthly_codes:
+    1: JAN
+    2: FEB
+    3: MAR
+    4: APR
+    5: MAY
+    6: JUN
+    7: JUL
+    8: AUG
+    9: SEP
+    10: OCT
+    11: NOV
+    12: DEC
+
+# Instruments that are always subscribed (index + futures).
+reference_instruments:
+  nifty_spot:
+    exchange: NSE
+    tradingsymbol: "NIFTY 50"
+  nifty_futures:
+    exchange: NFO
+    expiry_selector: current_month
+
+# Index candles are fetched from the historical REST API.
+index_history:
+  instruments: [nifty_spot]
+  # Backfill window on first run (calendar days of NIFTY index OHLCV).
+  # ~2 years: enough for the spec-4.3 seasonality gate (250 trading days) with
+  # room to spare. Override a single run with `--mode backfill --years N`.
+  backfill_days: 730
+  # Daily top-up: re-fetch the last N days to heal any gap.
+  topup_days: 10
+  # `backfill_interval: day` builds the long research history; the intraday
+  # interval is topped up in the same run so the live session has context.
+  # Both are Kite intervals (see core.constants.HISTORICAL_INTERVALS).
+  backfill_interval: day
+  topup_interval: minute

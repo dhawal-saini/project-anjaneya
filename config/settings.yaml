@@ -1,0 +1,83 @@
+# ===========================================================================
+# ANJANEYA - global settings
+# ===========================================================================
+# Every tunable lives in YAML.  No parameter may be hard-coded in Python.
+# `${VAR:-default}` is resolved from the environment (see core/config_loader).
+# ===========================================================================
+
+project:
+  name: ANJANEYA
+  full_title: "ANJANEYA - NIFTY50 Options AI Research Engine"
+  code_name: ANJANEYA
+  version: "0.1.0"
+  # Bumped whenever a stored data contract (tick/candle/feature/label schema)
+  # changes in a backward-incompatible way.
+  schema_version: 1
+
+time:
+  # Every timestamp in ANJANEYA is timezone-aware. Naive timestamps are a bug.
+  timezone: Asia/Kolkata
+  forbid_naive_timestamps: true
+
+market:
+  # Session bounds for the NIFTY derivatives market (IST, HH:MM).
+  session_start: "09:15"
+  session_end: "15:30"
+  # Research analysis only considers signal timestamps up to this time, so
+  # that a minimum holding horizon fits inside the session.
+  analysis_end: "15:15"
+  # Candle timeframes built in parallel by ANJANEYA-ENGINE (spec 4.7).
+  timeframes: ["1m", "3m", "5m", "15m"]
+
+data:
+  root: ${ANJANEYA_DATA_ROOT:-./data}
+  db_path: ${ANJANEYA_DB_PATH:-./db/anjaneeya.duckdb}
+  # Sub-directories are relative to `root`.
+  dirs:
+    raw: raw
+    candles: candles
+    features: features
+    labels: labels
+    datasets: datasets
+    models: models
+    predictions: predictions
+    backtests: backtests
+    reports: reports
+    logs: logs
+    runs: runs
+  parquet_compression: zstd
+
+engine:
+  # ANJANEYA-ENGINE (tick -> candle -> feature).  Only the derived-output
+  # switches live here: what a candle *is* (the session window, the timeframes)
+  # is defined in `market` above and in config/calendar.yaml.
+  # Mirror the candle table to data/candles/<timeframe>/<YYYY-MM-DD>.parquet
+  # next to DuckDB.  The mirror is derived data - it can always be rebuilt with
+  # `--mode build-candles` - so disabling it never loses information.
+  mirror_parquet: true
+
+logging:
+  level: ${ANJANEYA_LOG_LEVEL:-INFO}
+  console: true
+  file: true
+  # Per-app log file names are derived as `{app_name}.log`.
+  rotation: "00:00"
+  retention: "30 days"
+  # Optional machine-readable sink (one JSON object per line).
+  json_sink: false
+  json_sink_name: anjaneeya.jsonl
+  # Route stdlib logging (kiteconnect, urllib3, ...) into the same sinks.
+  intercept_stdlib: true
+
+run_tracking:
+  # Every run writes a manifest (run_id, config hash, git commit, package
+  # versions, seeds, artifacts) into `{data.root}/{data.dirs.runs}/<run_id>/`.
+  enabled: true
+  record_git_commit: true
+  record_packages:
+    - pandas
+    - numpy
+    - duckdb
+    - scikit-learn
+    - lightgbm
+    - kiteconnect

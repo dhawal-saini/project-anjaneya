@@ -1,0 +1,141 @@
+# ===========================================================================
+# ANJANEYA - market calendar, expiries, sessions, time-of-day buckets
+# ===========================================================================
+# NSE changes expiry weekdays and holiday lists. NOTHING here may be
+# hard-coded in Python: the calendar engine reads all of it from this file.
+# ===========================================================================
+
+timezone: Asia/Kolkata
+
+# --- sessions ---------------------------------------------------------------
+sessions:
+  regular:
+    start: "09:15"
+    end: "15:30"
+  half_day:
+    start: "09:15"
+    end: "13:00"
+  # Dates with a special (half-day) session, e.g. ["2026-12-24"].
+  half_day_dates: []
+  # Dates with an ad-hoc non-standard session window, e.g. muhurat trading.
+  special_sessions: []
+
+# --- weekly / monthly expiry -----------------------------------------------
+# NSE has used both Thursday and Tuesday for NIFTY weekly expiry over time, so
+# the weekday is configuration, never code.
+#
+# CONFIRMED Tuesday (checked 2026-09-30 against
+# data/raw/instruments/NFO_2026-09-30.json). Every NIFTY option expiry that dump
+# lists is a TUESDAY (2026-10-06, 2026-10-13, 2026-10-27, 2026-11-03,
+# 2026-12-29, the quarterly 2027-03-30, ...), and its two Monday expiries -
+# 2026-10-19 and 2026-11-23 - are exactly what `holiday_roll:
+# previous_trading_day` produces for the Dussehra (2026-10-20) and Guru Nanak
+# Jayanti (2026-11-24) Tuesdays. With `weekday: Thursday` the capture plan
+# resolved `0 option contract(s)` and a session captured the index with no
+# options while still exiting 0, so re-check this against a fresh
+# `data/raw/instruments/NFO_<date>.json` whenever a session captures nothing
+# (§1.4, §6). Confirm any change with `python -m apps.anjaneeya_capture.run
+# --mode capture --dry-run`: the `subscriptions` line must be non-zero.
+weekly_expiry:
+  weekday: Tuesday
+  # What to do when the expiry weekday is a holiday:
+  # previous_trading_day | next_trading_day | none
+  holiday_roll: previous_trading_day
+
+monthly_expiry:
+  # last_weekly_expiry_of_month -> the final weekly expiry in the month.
+  rule: last_weekly_expiry_of_month
+
+# --- holidays ---------------------------------------------------------------
+# RECONCILED on 2026-10-01 against NSE's official trading-holiday list, F&O
+# segment (the segment ANJANEYA trades). Source, fetched directly:
+#   https://www.nseindia.com/api/holiday-master?type=trading  ->  segment "FO"
+# The dates and names below are NSE's own, unedited, so the next annual check is
+# a diff against that same endpoint rather than a re-derivation of the festivals.
+# The raw response as fetched is committed at
+# docs/evidence/nse_holidays_2026.json, and tests/unit/test_market_calendar.py
+# asserts this file against it - so the three cannot drift apart silently.
+#
+# Two dates are independently confirmed by the exchange's own instrument dump
+# (data/raw/instruments/NFO_2026-09-30.json) - a second source that does not go
+# through the API above. NIFTY weekly expiry is Tuesday, and the dump lists
+# 2026-10-19 and 2026-11-23 as MONDAY expiries: exactly the
+# `previous_trading_day` roll for the Dussehra (2026-10-20) and Guru Nanak
+# (2026-11-24) Tuesdays below. A Tuesday NSE does not close produces no such
+# roll, so the roll is evidence rather than coincidence.
+#
+# `holidays_verified: true` because that reconciliation is done *for 2026*. It
+# covers 2026 only: set it back to false, or extend the list, before 2027-01-01,
+# when these entries stop covering the sessions actually being traded.
+#
+# Note on 2026-11-08 ("Diwali Laxmi Pujan*"): NSE's asterisk marks a date that
+# carries a *muhurat* trading session, and the date is a Sunday. The calendar can
+# represent that: a `sessions.special_sessions` entry is a trading day *by
+# declaration* and wins over both the weekend test and the holiday entry above
+# (see NseCalendar.is_trading_day / is_special_session), which is the only
+# precedence that can express a muhurat session at all - NSE also lists this
+# date as a trading holiday, and in other years it falls midweek.
+#
+# No entry is written here, because none has been verified: NSE announces the
+# muhurat window in a separate circular, and any figure written today would be a
+# plausible-looking guess - exactly the kind of input this file exists to avoid.
+# So the mechanism is ready and the *timing* is the missing fact. When the
+# circular is published, add the announced window verbatim:
+#   { date: "2026-11-08", start: "<announced start>", end: "<announced end>",
+#     name: "Muhurat trading" }
+# to `special_sessions` and the day becomes capturable. Until then the calendar
+# reports 2026-11-08 as closed, which is what this file actually knows.
+# See docs/phase_reports/phase_08.md.
+holidays_verified: true
+holidays:
+  # -- 2026: NSE F&O trading holidays (20 dates, NSE's own descriptions) --
+  - { date: "2026-01-15", name: "Municipal Corporation Election - Maharashtra", verified: true }
+  - { date: "2026-01-26", name: "Republic Day", verified: true }
+  - { date: "2026-02-15", name: "Mahashivratri", verified: true }
+  - { date: "2026-03-03", name: "Holi", verified: true }
+  - { date: "2026-03-21", name: "Id-Ul-Fitr (Ramadan Eid)", verified: true }
+  - { date: "2026-03-26", name: "Shri Ram Navami", verified: true }
+  - { date: "2026-03-31", name: "Shri Mahavir Jayanti", verified: true }
+  - { date: "2026-04-03", name: "Good Friday", verified: true }
+  - { date: "2026-04-14", name: "Dr. Baba Saheb Ambedkar Jayanti", verified: true }
+  - { date: "2026-05-01", name: "Maharashtra Day", verified: true }
+  - { date: "2026-05-28", name: "Bakri Id", verified: true }
+  - { date: "2026-06-26", name: "Muharram", verified: true }
+  - { date: "2026-08-15", name: "Independence Day", verified: true }
+  - { date: "2026-09-14", name: "Ganesh Chaturthi", verified: true }
+  - { date: "2026-10-02", name: "Mahatma Gandhi Jayanti", verified: true }
+  - { date: "2026-10-20", name: "Dussehra", verified: true }
+  - { date: "2026-11-08", name: "Diwali Laxmi Pujan*", verified: true }
+  - { date: "2026-11-10", name: "Diwali-Balipratipada", verified: true }
+  - { date: "2026-11-24", name: "Prakash Gurpurb Sri Guru Nanak Dev", verified: true }
+  - { date: "2026-12-25", name: "Christmas", verified: true }
+
+# --- days_to_expiry definition (section 7) ---------------------------------
+# ANJANEYA supports three definitions; the choice MUST be documented because
+# it changes every DTE-based analysis.
+#   calendar_days   -> expiry_date - current_date
+#   trading_days    -> number of trading sessions strictly between the two
+#   minutes_to_close-> minutes from timestamp to the expiry session end
+days_to_expiry:
+  definition: minutes_to_close
+  # Hours the DTE value is capped at, to keep the feature bounded.
+  max_minutes: 10080   # 7 calendar days
+
+# --- expiry-cycle phase (RQ1) ---------------------------------------------
+expiry_cycle:
+  start_of_cycle:
+    # A trading day counts as START_OF_CYCLE if it is within this many trading
+    # days from the previous expiry (1 => the first trading session after it).
+    days_after_previous_expiry: 1
+  # Every other trading day before the expiry is MID_CYCLE; the expiry date
+  # itself is EXPIRY_DAY.
+
+# --- time-of-day buckets (RQ2) ---------------------------------------------
+# Boundaries are [start, end) and must tile the analysis window. Bucket names
+# are stable identifiers used as feature values - do not rename casually.
+time_of_day_buckets:
+  - { name: OPEN_915_930, start: "09:15", end: "09:30" }
+  - { name: MORNING_930_1100, start: "09:30", end: "11:00" }
+  - { name: MIDDAY_1100_1300, start: "11:00", end: "13:00" }
+  - { name: AFTERNOON_1300_1430, start: "13:00", end: "14:30" }
+  - { name: CLOSE_1430_1515, start: "14:30", end: "15:15" }

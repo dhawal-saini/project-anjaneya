@@ -1,0 +1,410 @@
+# ===========================================================================
+# ANJANEYA - model, labels, walk-forward validation, Indian cost model
+# ===========================================================================
+# Section 4.3 data-accumulation gates are enforced here. ANJANEYA-AI MUST
+# refuse to train a "production" model below `ml_training_min_days` and must
+# label smaller-sample results as PRELIMINARY / EXPLORATORY.
+# ===========================================================================
+
+random_seed: 42
+
+# --- prediction targets -----------------------------------------------------
+# ANJANEYA never predicts BUY/SELL. It predicts future behaviour over
+# multiple horizons; the decision layer (Phase 24) is separate.
+horizons_minutes: [5, 10, 15, 30]
+
+algorithm: lightgbm
+fallback_algorithm: xgboost
+
+# --- data accumulation gates (section 4.3) ---------------------------------
+data_gates:
+  exploratory_min_days: 20
+  # Relaxed 60 -> 45 so an early EXPLORATORY model can train on the first weeks
+  # of accumulated data. It still refuses below this and labels anything under
+  # `meaningful_backtest_min_days` as preliminary (spec 4.3 is about honesty,
+  # not about a fixed number).
+  ml_training_min_days: 45
+  meaningful_backtest_min_days: 120
+  seasonality_min_days: 250
+
+# --- labels -----------------------------------------------------------------
+labels:
+  # How the classification thresholds are expressed:
+  #   atr     -> threshold = atr_multiple * ATR (volatility normalized)
+  #   percent -> threshold = percent * price
+  #   fixed   -> threshold is a raw price move
+  normalization: atr
+  normalization_param: 0.5
+  percent_threshold: 0.0015
+  fixed_threshold: 1.0
+  # How far back the "prior move" is measured. A clearing move that agrees with it is
+  # a continuation, one that goes against it is a reversal (core/labels/label_builder.py).
+  trend_lookback: 5
+  classes: [UP_CONTINUATION, DOWN_CONTINUATION, RANGE, REVERSAL]
+  version: "v1"
+
+# --- the training matrix (section 21) --------------------------------------
+# ANJANEYA-AI joins each stored feature row to the forward label of the same
+# (timestamp, contract) - never to a nearby one - and splits the result with the
+# purged walk-forward policy below. One dataset artefact is written per horizon.
+dataset:
+  # Which candle timeframe a training row is built from. The features table is
+  # keyed by timestamp + contract and carries the timeframe as a column, so this
+  # picks the rows out of it; it must be one of settings.market.timeframes.
+  timeframe: 1m
+  # Feature columns a tree model must be told are *labels*, not numbers. Every
+  # name must be a column of the stored feature row; anything label-derived
+  # (future_*, label, label_code) is refused outright, because no knob in a
+  # config file may put a label into the feature matrix.
+  categorical_columns:
+    - option_type
+    - nifty_regime
+    - candle_direction
+    - swing_label
+    - market_structure_state
+    - event_prev_day_high_state
+    - event_prev_day_low_state
+    - event_today_high_state
+    - event_today_low_state
+    - expiry_cycle_phase
+    - time_of_day_bucket
+
+# --- the trainer (section 21) ----------------------------------------------
+# ANJANEYA-AI trains one LightGBM multiclass model per horizon on the matrix
+# ``--mode dataset`` built (a class probability per row; ANJANEYA never predicts
+# BUY/SELL - the decision layer is Phase 24). Every value below is validated,
+# hashed into the config hash and copied into each model's metadata, so a model
+# artefact states exactly how it was produced.
+training:
+  n_estimators: 300
+  learning_rate: 0.05
+  num_leaves: 31
+  max_depth: -1              # -1 = unbounded depth (num_leaves still applies)
+  min_child_samples: 40
+  feature_fraction: 0.8
+  bagging_fraction: 0.8
+  bagging_freq: 1
+  lambda_l1: 0.0
+  lambda_l2: 0.0
+  # none | balanced. The four label classes are not equally frequent, and an
+  # unweighted tree can post a good log loss by never predicting the rare one.
+  class_weight: none
+  # 0 = OFF. Stopping on the fold's own validation window would make the number
+  # reported for that window optimistic; turn it on knowingly (the run says so).
+  early_stopping_rounds: 0
+  n_jobs: 0                  # 0 = every core
+
+# --- purged walk-forward validation (section 22) ---------------------------
+# Relaxed windows (90/15 -> 30/10) so the very first walk-forward can run on an
+# earlier, thinner accumulation. The windows and data_gates.ml_training_min_days
+# move together: a 30-day train window needs ~30 captured days, not 60. Widen
+# them back once the accumulation supports it.
+walk_forward:
+  train_window_days: 30
+  validate_window_days: 10
+  # Embargo MUST be >= the maximum label horizon (max(horizons_minutes) = 30).
+  embargo_minutes: 30
+  # Final untouched holdout - never used for tuning.
+  holdout_days: 30
+  step_days: 15
+  purge: true
+
+# --- Indian F&O transaction cost model (section 23) ------------------------
+# Values are defaults for NIFTY options (options are cash settled, premium is
+# the taxable turnover). Verify against the current Zerodha/broker + statutory
+# rates before trusting backtest P&L; they change.
+costs:
+  brokerage_per_order: 20.0
+  stt_rate: 0.000625          # on sell premium (options)
+  exchange_txn_rate: 0.0003503
+  sebi_rate: 0.000001          # per crore turnover
+  gst_rate: 0.18               # on brokerage + exchange txn + SEBI
+  stamp_duty_rate: 0.00003     # on buy side
+  slippage_bps: 5.0
+  # Use bid/ask captured from live ticks when available (falls back to
+  # slippage_bps otherwise).
+  use_captured_spread: false
+
+execution:
+  # Signals are generated at the close of candle T.
+  signal_at: candle_close
+  # next_open | bid_ask
+  fill_at: next_open
+  latency_ms: 0
+
+# --- the backtest's bridge from a prediction to a position (section 23) -----
+# Spec 24's decision layer (the `decision:` block below) is separate and this replay
+# does not use it; this is the *smallest* honest rule that lets a backtest measure
+# costs: enter the option side whose directional class the model
+# gives at least `min_probability`. Every backtest report prints that sentence next to its
+# numbers. `directions` values must be classes from labels.classes (checked at load).
+backtest:
+  signal:
+    mode: probability_threshold
+    min_probability: 0.40
+    # true = only enter when the directional class is also the model's top class.
+    require_argmax: true
+    directions:
+      CE: UP_CONTINUATION
+      PE: DOWN_CONTINUATION
+  sizing:
+    lots: 1
+    # One NIFTY lot. Verify against the current contract specification before quoting P&L.
+    lot_size: 75
+  exit:
+    # Stop and target are ATR multiples of the option's own ATR at the *signal* bar.
+    stop_loss_atr: 1.0
+    target_atr: 1.5
+    max_holding_minutes: 30
+    # Never hold a weekly option overnight: close at the session's last bar.
+    flat_at_session_end: true
+    # Bars cannot say which came first when one bar touches both; stop-first is the
+    # pessimistic choice, and the count of such bars is reported.
+    intrabar_priority: stop_first
+    exit_on_opposite_signal: true
+
+# --- the decision layer (spec 24, master-prompt phase 24) -------------------
+# The master prompt ends its phase list with "PHASE 24 - Decision Layer (later,
+# separate - only after features, model and backtest are validated)" and says
+# twice that ANJANEYA "never predicts BUY/SELL. It predicts future behaviour over
+# multiple horizons; the decision layer is separate". `--mode decide` is that
+# separate piece: it reads stored feature rows, scores them with one model
+# artefact, and records what *this rule* would do with each one (ENTER_CE /
+# ENTER_PE / NO_TRADE plus a reason code) under data/predictions/.
+#
+# It is NOT advice and it is NOT the backtest: nothing places an order, and the
+# exit plan below is *stated* in the record, not simulated (replaying it against
+# stored prices, with costs, is --mode backtest's job). The values deliberately
+# parallel backtest.signal so they are recognisable, but they are independent -
+# changing one here never silently changes the backtest. `directions` values must
+# be classes from labels.classes (checked at load, exactly as the backtest's are).
+decision:
+  # The master-spec phase this block implements (printed in every artefact).
+  spec: "24"
+  # The directional class the option side needs must reach at least this much.
+  min_probability: 0.40
+  # true = only decide when the directional class is also the model's top class.
+  require_argmax: true
+  # The smallest lead over the runner-up class an entry may have (0 = no floor).
+  min_margin: 0.0
+  directions:
+    CE: UP_CONTINUATION
+    PE: DOWN_CONTINUATION
+  # Position size the record carries. One NIFTY lot; verify against the current
+  # contract specification before reading a size as money.
+  lots: 1
+  lot_size: 75
+  # The most entries one trading day may carry (null = no throttle). The budget
+  # goes to the earliest signals of the day, across every symbol in scope.
+  max_decisions_per_day: null
+  # The exit plan the decision records. Stated, never simulated here.
+  stop_loss_atr: 1.0
+  target_atr: 1.5
+  max_holding_minutes: 30
+  flat_at_session_end: true
+
+# --- evaluation / reporting -------------------------------------------------
+evaluation:
+  probability_metrics: [log_loss, brier_score, calibration_curve]
+  baselines:
+    - always_up
+    - always_range
+    - random
+    - nifty_regime_only
+  # Minimum trades/samples before an apparent edge is reported as anything
+  # other than PRELIMINARY.
+  preliminary_min_samples: 30
+  # Multiple-testing correction for the time-of-day / cycle-phase matrices.
+  multiple_testing_correction: benjamini_hochberg
+  significance_level: 0.05
+
+# --- explainability (spec 26) ------------------------------------------------
+# Spec 26 asks every prediction to be explainable "in plain structured form" and lists
+# the blocks it expects - NIFTY, OPTION, PRICE ACTION, CANDLE, S/R, CONTEXT, the model's
+# top class probabilities - adding that those values are *examples*. So the blocks, and
+# the columns inside them, are configured here rather than written into the code.
+explainability:
+  # The master-spec section this structure comes from (printed in every artefact).
+  spec: "26"
+  # How many of the model's class probabilities an explanation prints.
+  probabilities: 3
+  # Decimals for every number in an explanation.
+  digits: 4
+  # How many predictions `--mode explain` describes when --rows is not given.
+  rows: 5
+  # Printed (and stored) when a stored feature is NULL at that instant: an explanation
+  # may never turn "unknown" into 0.
+  missing_text: unknown
+  # One section per spec-26 block. `groups` names stored feature *groups*
+  # (core/features/feature_builder.FEATURE_GROUPS); `columns` lists individual stored
+  # feature columns. Both are checked against the feature contract at load, a column may
+  # appear in exactly one section, and the `identity`/`provenance` groups are reserved
+  # (every explanation carries its contract identity in its header and the row's
+  # provenance in its audit block). The AI block - the model's top class probabilities -
+  # is always appended last, from the model's own metadata.
+  sections:
+    - key: nifty
+      title: NIFTY
+      groups: [nifty]
+    - key: option
+      title: OPTION
+      groups: [option]
+    - key: price_action
+      title: PRICE ACTION
+      groups: [levels, level_events, structure]
+    - key: candle
+      title: CANDLE
+      groups: [candle]
+    - key: support_resistance
+      title: SUPPORT / RESISTANCE
+      groups: [support_resistance]
+    - key: context
+      title: CONTEXT
+      groups: [context, relative]
+
+# --- feature importance (spec 27) --------------------------------------------
+# Spec 27 asks for three measurements after training - native importance, permutation
+# importance and *optional* SHAP - and then for the question they exist to answer: does the
+# predictive information come from the NIFTY regime, the option's moving averages, candle
+# behaviour, S/R, structure, IV, the greeks, OI, the option residual, time of day, cycle
+# phase or time to expiry? "Do not assume. Measure. Report with confidence intervals where
+# practical." So the measurement and the source map are both configured here.
+importance:
+  # The master-spec section this structure comes from (printed in every artefact).
+  spec: "27"
+  # Decimals for every number an artefact prints (trailing zeros are trimmed).
+  digits: 4
+  # How many times each feature is permuted when measuring its importance. At least 2: the
+  # interval is the point of the exercise, and one repeat has no spread to put one on.
+  repeats: 5
+  # log_loss | accuracy. Both are faithful scoring rules; log loss is the default because it
+  # is the metric the trainer already reports, so the two numbers are comparable.
+  metric: log_loss
+  # Confidence level of every interval (two-sided Student's t over the repeats).
+  confidence: 0.95
+  # holdout = spec 22's reserved days, the only rows the split promises the final model was
+  # not trained on; matrix = every stored row (the artefact then carries the in-sample
+  # caveat, because an in-sample number is only honest when it is labelled one).
+  sample: holdout
+  # The most rows a measurement uses (the newest ones); the rows left out are counted and
+  # reported, never folded away.
+  max_rows: 2000
+  # auto   = measure SHAP if it is installed, otherwise record why it could not run
+  # on     = refuse to run without SHAP (it is the optional extra `pip install -e .[explain]`)
+  # off    = never import it
+  shap: auto
+  # The most rows SHAP is asked to explain.
+  shap_rows: 500
+  # Seed for the permutations. null = use model.random_seed, so a run is reproducible by
+  # quoting one number.
+  seed: null
+  # One entry per source spec 27 names. `groups` names stored feature *groups*
+  # (core/features/feature_builder.FEATURE_GROUPS) and `columns` lists individual stored
+  # feature columns; both are checked against the feature contract at load, and a column
+  # claimed by two sources is refused. A feature no source claims is reported under
+  # `unmapped` rather than attributed to a source that did not measure it. The last four
+  # sources claim columns spec 27 does not name - their titles say so - so that no model
+  # input is left unattributed.
+  topics:
+    - key: nifty_regime
+      title: NIFTY regime
+      groups: [nifty]
+    - key: option_ma
+      title: option moving averages
+      groups: [option]
+    - key: candle_behaviour
+      title: candle behaviour
+      groups: [candle]
+    - key: support_resistance
+      title: support / resistance
+      groups: [support_resistance]
+    - key: structure
+      title: market structure
+      groups: [structure]
+    - key: price_action
+      title: price action, levels (not named by spec 27)
+      groups: [levels, level_events]
+    - key: iv
+      title: implied volatility
+      columns: [iv, iv_change]
+    - key: greeks
+      title: greeks
+      columns: [delta, gamma, theta, vega]
+    - key: oi
+      title: open interest
+      columns: [oi, oi_change]
+    - key: option_residual
+      title: option residual (expected vs actual move)
+      columns: [expected_option_move, actual_option_move, option_residual]
+    - key: time_of_day
+      title: time of day
+      columns: [time_of_day_bucket]
+    - key: cycle_phase
+      title: expiry-cycle phase
+      columns: [expiry_cycle_phase]
+    - key: time_to_expiry
+      title: time to expiry
+      columns: [days_to_expiry]
+    - key: day_of_week
+      title: day of week (not named by spec 27)
+      columns: [day_of_week]
+    - key: option_contract
+      title: option side (not named by spec 27)
+      columns: [option_type]
+    - key: option_context
+      title: "option context: moneyness and volume (not named by spec 27)"
+      columns: [distance_from_atm, volume]
+
+
+charts:
+  # The master-spec section these charts come from (printed beside every figure's title).
+  spec: "28"
+  # Decimals for a value printed on a chart (a P&L in rupees, a score).
+  digits: 2
+  # Raster resolution and figure size (inches). `height` is the wide-chart height; the
+  # importance-bars chart is drawn at `tall_height` because it is one long ranked column.
+  dpi: 120
+  width: 14.0
+  height: 7.0
+  tall_height: 9.0
+  # png is the default because a chart is a validation convenience, not an artefact of record
+  # (the JSON/Markdown beside it are). svg/pdf work for a notebook or a slide.
+  format: png
+  # A P&L can be positive or negative, so the heatmaps use a diverging colormap centred on 0;
+  # a magnitude (if a later chart needs one) would use the sequential map.
+  colormap: RdYlGn
+  sequential_colormap: viridis
+  # The most important features the importance chart shows, and the caps that keep a dense
+  # series or a busy overlay from making an unreadable figure.
+  top_features: 20
+  max_points: 30000
+  max_markers: 60
+
+
+# --- continuous data-accumulation report (spec 29) ---------------------------
+# Master-prompt phase 25 asks for a recurring summary of "data captured, coverage, gaps,
+# sample sizes, readiness for retraining" - the report that says whether it is time to
+# retrain, and what is still missing. The four spec 4.3 gate *values* stay in data_gates
+# above, so this report and `--mode train` can never disagree about which gate is open; the
+# block below holds only presentation and the sample-size floors.
+accumulation:
+  # The master-spec section this report comes from (printed in every artefact).
+  spec: "29"
+  # How many weeks back the captured-day series is bucketed (the report's window).
+  window_weeks: 4
+  # If the newest captured day is older than this, the report says "capture may have
+  # stopped" - the one failure a weekly report exists to notice.
+  stale_days: 10
+  # A captured day counts as *complete* at or above this coverage ratio; below it, the day
+  # is listed as an observation (a day can have ticks and still have missing bars).
+  healthy_coverage_ratio: 0.9
+  # Sample-size floors a retrain is worth considering against (not conclusions - the report
+  # only says whether there is enough recorded data to try).
+  retrain_min_feature_rows: 5000
+  retrain_min_label_rows: 5000
+  # A model older than this many days, on enough data, is flagged as due for a retrain.
+  retrain_max_model_age_days: 30
+
+
+
+

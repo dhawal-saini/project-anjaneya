@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# ANJANEYA .gitignore
+# ---------------------------------------------------------------------------
+# Rule: raw captured market data is NEVER committed. It is expensive to
+# acquire and cannot be regenerated from the repo.
+# ---------------------------------------------------------------------------
+
+# --- secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*token*.json
+
+# --- data (raw, immutable, capture-only) ---
+data/**
+!data/.gitkeep
+!data/**/.gitkeep
+
+# --- local analytical database ---
+db/*.duckdb
+db/*.duckdb.wal
+db/*.wal
+
+# --- model / run artifacts ---
+# (model binaries are excluded by extension and by directory, never by a
+#  blanket *.txt rule - that would also swallow the project's master spec)
+models/
+*.joblib
+*.pkl
+*.lgb
+*.model
+*.bin
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+
+# --- editors / os ---
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# --- notebooks ---
+notebooks/**/*.ipynb_checkpoints/
+
+# transient logs from local tooling
+uv_sync.log

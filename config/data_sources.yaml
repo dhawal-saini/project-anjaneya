@@ -1,0 +1,163 @@
+# ===========================================================================
+# ANJANEYA - external data sources
+# ===========================================================================
+# Only environment variable NAMES live here. Actual secrets live in `.env`.
+#
+# Zerodha Kite Connect facts this design assumes:
+#   * Historical OHLCV (REST) is available for the NIFTY index, NIFTY futures
+#     and ACTIVE option contracts only.
+#   * Historical OHLCV is NOT available for EXPIRED option contracts, so the
+#     options dataset is accumulated live by ANJANEYA-CAPTURE.
+#   * WebSocket streaming: up to `max_instruments` per connection, up to
+#     `max_connections` connections per API key.
+#   * REST quotes are rate limited (~1 req/s) and must never be used as a
+#     live feed; the WebSocket is the live feed.
+#   * Historical candle endpoint: ~3 req/s. Other endpoints: ~10 req/s.
+# ===========================================================================
+
+zerodha:
+  enabled: true
+
+  # --- credentials (names only!) ---
+  api_key_env: ZERODHA_API_KEY
+  api_secret_env: ZERODHA_API_SECRET
+  user_id_env: ZERODHA_USER_ID
+  password_env: ZERODHA_PASSWORD
+  totp_key_env: ZERODHA_TOTP_KEY
+  redirect_url_env: ZERODHA_REDIRECT_URL
+
+  # --- HTTP behaviour ---
+  timeouts:
+    request_seconds: 7
+    login_seconds: 15
+
+  # --- rate limits (requests per second, per endpoint class) ---
+  rate_limits:
+    quote_per_second: 1
+    historical_per_second: 3
+    other_per_second: 10
+    # Safety factor applied to the configured limits (<1.0 = more conservative).
+    safety_factor: 0.9
+
+  # --- access-token handling ---
+  token_store:
+    path: ./data/raw/.tokens/zerodha_token.json
+    # Zerodha invalidates access tokens daily. A token is treated as stale
+    # once this cutoff (IST, HH:MM) has passed on the day AFTER login.
+    validity_cutoff: "06:00"
+    # Re-authenticate automatically when the stored token is stale / missing.
+    refresh_on_startup: true
+    # Refuse to use a token that expires within this many minutes.
+    min_remaining_minutes: 30
+
+  # --- retry policy (applies to every REST call) ---
+  retry:
+    max_attempts: 5
+    initial_backoff_seconds: 1.0
+    backoff_multiplier: 2.0
+    max_backoff_seconds: 60.0
+    jitter: true
+    # HTTP status codes that are worth retrying.
+    retry_on_status: [429, 500, 502, 503, 504]
+
+  # --- websocket (KiteTicker) ---
+  # The SDK owns the socket and its reconnect loop; we own the *watchdog*.
+  websocket:
+    max_instruments: 3000
+    max_connections: 3
+    # ltp | quote | full. FULL (184-byte packets) is required for OI and market
+    # depth - and depth is the only source of a two-sided quote, because the
+    # tick payload carries no explicit bid/ask field.
+    mode: full
+    connect_timeout_seconds: 30
+    # KiteTicker's own reconnect budget/backoff (reconnect_max_tries/max_delay).
+    reconnect_initial_seconds: 2.0
+    reconnect_multiplier: 2.0
+    reconnect_max_seconds: 60.0
+    max_reconnect_attempts: 50
+    # Watchdog: reconnect if the socket sends *nothing* for this long during
+    # session hours. Kite streams a 1-byte heartbeat, so silence means a dead
+    # socket, not a quiet market.
+    stall_timeout_seconds: 60
+
+  # --- option chain polling (OI / IV snapshots) ---
+  option_chain:
+    interval_seconds: 60
+    quotes_per_request: 500
+    use_websocket_mode_quote: true
+
+  # --- ANJANEYA-CAPTURE session behaviour ---
+  capture:
+    # How long before the session open the app is allowed to start waiting.
+    session_start_guard_minutes: 15
+    # Started before the open -> wait for 09:15 instead of failing.
+    wait_for_session_open: true
+    # Started after the close -> stop immediately with a clear message.
+    auto_stop_at_session_end: true
+    # `--smoke` captures for this many minutes, then shuts down cleanly.
+    smoke_minutes: 3
+    # A heartbeat JSON file is rewritten at this cadence (atomic replace).
+    heartbeat:
+      interval_seconds: 10
+      # A heartbeat older than this means the capture process is not healthy.
+      stale_after_seconds: 90
+      filename: capture.json
+    # Re-centre the strike window on ATM at this cadence (null disables it).
+    # NIFTY moves; a window fixed at 09:15 drifts away from the money.
+    universe_refresh_minutes: 30
+    # record = store out-of-session ticks with quality_flag=OUT_OF_SESSION,
+    # drop = discard them (they are never silently mixed into session data).
+    out_of_session_ticks: record
+    # Ticks are the immutable record: identical consecutive ticks are kept.
+    dedupe_identical_ticks: false
+    # Periodic status/health log line cadence.
+    status_interval_seconds: 60
+
+    # --- gap detection (tick streams have no fixed row count) ---
+    gaps:
+      # A silence longer than this, while the market is open, is a gap.
+      tick_gap_seconds: 30
+      # Gaps are logged at most this many times per session (then rolled up).
+      log_limit_per_session: 200
+
+    # --- DuckDB batching + the Parquet mirror ---
+    storage:
+      flush_rows: 5000
+      flush_seconds: 5
+      # Hard cap before the buffer is spilled to a Parquet part file instead of
+      # being dropped (never lose a tick because the disk was briefly slow).
+      max_buffer_rows: 100000
+      mirror_parquet: true
+      parquet_compression: zstd
+      # Parquet part files are laid out per day: <stream>/<YYYY-MM-DD>/part-*.parquet
+      parquet_partition: day
+
+    # --- instrument master ---
+    instruments:
+      # Relative to `settings.data.dirs.raw`, so the dump cache lives beside the
+      # other raw inputs: <data root>/raw/instruments/NSE_<date>.json
+      cache_dir: instruments
+      # Re-download the daily dump when the cache is older than this.
+      refresh_ttl_hours: 12
+      exchanges: [NSE, NFO]
+
+    # --- REST historical fetch (index backfill / top-up) ---
+    historical:
+      default_interval: minute
+      # Kite's historical endpoint returns at most ~60 days of minute data per
+      # request and ~2000 days of daily data; ANJANEYA never relies on the
+      # server's (undocumented) range check - it plans windows itself, below
+      # these conservative ceilings.
+      max_days_per_request:
+        minute: 30
+        3minute: 60
+        5minute: 90
+        10minute: 120
+        15minute: 180
+        30minute: 240
+        60minute: 365
+        day: 1800
+      # On a range/validation error, halve the window and retry (down to
+      # `max_split_depth` levels) instead of losing the whole range.
+      adaptive_split_on_error: true
+      max_split_depth: 6

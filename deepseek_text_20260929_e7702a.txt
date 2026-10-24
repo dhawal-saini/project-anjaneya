@@ -1,0 +1,1124 @@
+MASTER PROMPT — ANJANEYA
+====================================================
+Project Code Name: ANJANEYA
+Full Title: ANJANEYA — NIFTY50 Options AI Research Engine
+Data Source: Zerodha Kite Connect API v3
+Architecture: 3 standalone Python apps + shared core library
+Coder: DeepSeek API
+
+ROLE
+----
+Act as a Senior Quantitative Developer, Python Engineer, Data Engineer
+and Machine Learning Engineer.
+
+You are building ANJANEYA: a research and backtesting system for NIFTY50
+and NIFTY50 options using Zerodha Kite Connect API as the primary data
+source.
+
+This is NOT a live trading system. This is NOT a broker execution system.
+
+The system has four long-term goals:
+
+1. Fetch NIFTY index history from Zerodha.
+2. Capture NIFTY options market data LIVE, day by day, and build our own
+   historical dataset over time (Zerodha does not provide historical
+   expired-option data, so we must accumulate it ourselves).
+3. Compute a rich feature set: NIFTY trend/regime, option trend,
+   candle behaviour, support/resistance, market structure, option
+   Greeks/IV/OI, and relative behaviour.
+4. Answer these SPECIFIC research questions using accumulated data:
+
+   RQ1. How do NIFTY weekly options behave on expiry day vs start of
+        expiry cycle vs mid-cycle?
+
+   RQ2. Which time windows between 09:15 and 15:15 IST produce the most
+        favourable risk-adjusted behaviour for CE vs PE?
+
+   RQ3. Do time-of-day, day-of-week, and days-to-expiry interact with
+        NIFTY regime and candle behaviour in a predictive way?
+
+   RQ4. Can an ML model trained on the above features produce
+        statistically meaningful predictions of future short-horizon
+        behaviour, after transaction costs?
+
+Everything must be measured. Nothing must be assumed.
+
+IMPORTANT — WORKING STYLE
+-------------------------
+Do not build everything in one step. Implement phase-by-phase.
+After every phase:
+  - implement the code
+  - write/update pytest tests
+  - run the tests
+  - provide sample output
+  - explain what was implemented
+  - list assumptions and open questions
+  - STOP and wait for approval before the next phase.
+
+Do not silently invent missing requirements. If something is ambiguous,
+make it configurable and document the assumption.
+
+============================================================
+1. CORE DESIGN PRINCIPLES
+============================================================
+
+- Modular. No giant single-file scripts.
+- Every calculation has a dedicated function/class with unit tests.
+- Every parameter lives in a config file, never hard-coded.
+- No look-ahead bias. No future data leakage.
+- No mixing of option contracts across expiries/strikes/types.
+- Timestamps are timezone-aware, always Asia/Kolkata.
+- Raw data is immutable. Processed data is reproducible from raw +
+  config.
+- The system must be able to run for months unattended and accumulate
+  data safely.
+
+============================================================
+2. ARCHITECTURE — ANJANEYA'S 3 STANDALONE APPS
+============================================================
+
+ANJANEYA is NOT one giant Python file.
+ANJANEYA is NOT a heavy microservices or 3-tier web architecture.
+
+ANJANEYA is THREE small, focused Python applications that share a
+common core library and a common local database. Each app can be
+started, stopped, and debugged independently. They communicate only
+through the filesystem / database, never through HTTP or a message
+broker.
+
+APP 1 — ANJANEYA-CAPTURE
+------------------------
+Purpose: fetch and store raw market data.
+Runs: continuously during market hours (09:15–15:30 IST).
+Responsibilities:
+  - Refresh Zerodha access token automatically each morning (TOTP login).
+  - Download NIFTY index historical OHLCV (backfill + daily top-up).
+  - Connect to KiteTicker WebSocket.
+  - Subscribe to NIFTY index, NIFTY futures, and the configured option
+    universe (ATM ± N strikes, current weekly expiry, next weekly expiry).
+  - Store every tick in a local database (DuckDB or Parquet).
+  - Poll the option chain periodically for OI/IV snapshots (rate-limited).
+  - Log every API call, every reconnect, every gap.
+  - Handle disconnections with exponential backoff.
+  - Never drop a tick silently.
+
+APP 2 — ANJANEYA-ENGINE
+-----------------------
+Purpose: transform raw ticks/history into candles and features.
+Runs: every N minutes during market hours + once after close.
+Responsibilities:
+  - Build OHLCV candles from stored ticks (configurable timeframe).
+  - Compute all indicator engines (NIFTY trend, option trend, candle,
+    levels, structure, S/R, Greeks, option context).
+  - Assemble the unified feature table.
+  - Validate features.
+  - Write features to the feature store.
+
+APP 3 — ANJANEYA-AI
+-------------------
+Purpose: train, predict, backtest, and report.
+Runs: daily (after close) and on-demand.
+Responsibilities:
+  - Build ML datasets from features + labels.
+  - Train model using purged walk-forward validation.
+  - Generate predictions.
+  - Run backtests with realistic Indian transaction costs.
+  - Produce time-of-day / day-of-week / days-to-expiry analysis.
+  - Generate charts, reports, feature importance.
+  - Archive model versions and run metadata.
+
+SHARED CORE LIBRARY
+-------------------
+A `core/` package imported by all three apps. Contains pure logic only
+(no I/O side effects at import time):
+  - indicators, nifty engine, options engine, price_action engine,
+    features, ml utilities, backtest math, market calendar, config
+    loader, logging helpers, data schemas, validation.
+
+Each app has its own `run.py` entry point. Shell scripts in `scripts/`
+handle scheduling (cron / Windows Task Scheduler / manual start).
+
+============================================================
+3. TECHNOLOGY
+============================================================
+
+Python 3.11+.
+
+Required:
+  pandas, numpy, scipy
+  scikit-learn, lightgbm (or xgboost)
+  matplotlib
+  pyarrow
+  duckdb                # local analytical database
+  pydantic              # config + schema validation
+  kiteconnect           # Zerodha SDK
+  pyotp                 # TOTP for Zerodha login
+  requests
+  python-dotenv
+  pyyaml
+  loguru or equivalent structured logging
+  pytest, pytest-cov
+
+Optional:
+  shap                  # feature attribution
+  plotly                # interactive charts
+  streamlit             # lightweight dashboard (later)
+
+Do NOT introduce unnecessary dependencies.
+
+============================================================
+4. ZERODHA KITE CONNECT — DATA STRATEGY
+============================================================
+
+CRITICAL FACTS YOU MUST DESIGN AROUND:
+
+4.1 What Zerodha Provides
+- Historical OHLCV (REST) for NIFTY index, NIFTY futures, active
+  (unexpired) option contracts, equities.
+- Historical OHLCV is NOT available for expired option contracts.
+  Zerodha's official position: do not query expired instruments.
+- WebSocket (KiteTicker) streaming for up to 3,000 instruments per
+  connection, up to 3 connections per API key.
+- REST /quote endpoints: ~1 req/sec, up to 500–1000 instruments per
+  call. Not suitable as a live feed — use WebSocket.
+- Historical candle rate limit: ~3 requests/sec.
+- Other endpoints: ~10 requests/sec.
+- OI is available in historical candle responses when `oi=1`.
+
+4.2 ANJANEYA's Data Strategy
+- NIFTY index history: fetched from Zerodha (historical API).
+- NIFTY options history: BUILT BY ANJANEYA-CAPTURE, captured live, day
+  by day, from WebSocket ticks + periodic option chain snapshots.
+- This means the options dataset grows over time. ANJANEYA-AI must
+  wait for enough accumulated days before training a serious model.
+
+4.3 Data Accumulation Milestones
+ANJANEYA must track and report data coverage. Suggested gates:
+- 20 trading days captured → first exploratory analysis allowed.
+- 60 trading days captured → first ML model training allowed.
+- 120+ trading days captured → statistically meaningful backtests.
+- 250+ trading days captured → seasonality and regime analysis.
+
+These thresholds are configurable. ANJANEYA-AI MUST refuse to train a
+"production" model below the configured minimum and must clearly label
+any preliminary results as PRELIMINARY / EXPLORATORY.
+
+4.4 Authentication
+Zerodha requires daily login. Implement:
+- TOTP-based automated login (pyotp)
+- request_token → access_token exchange
+- token persistence with daily refresh
+- clear failure logging, retry policy
+- credentials ONLY from environment variables or .env (never in code)
+
+4.5 Rate Limiting
+Implement a token-bucket rate limiter for every REST endpoint used.
+Log every 429 response. Never retry without backoff.
+
+4.6 Tick Storage Schema (minimum)
+Each tick row: timestamp (UTC + IST), instrument_token, tradingsymbol,
+last_price, volume_traded, oi, bid, ask, bid_qty, ask_qty, source.
+Store append-only. Never overwrite captured ticks.
+
+4.7 Candle Builder Rules
+- Built strictly from stored ticks.
+- Never mix ticks from different contracts.
+- Handle first candle of day, last candle, missing ticks, zero-range.
+- Store candles in a separate table/file from ticks.
+- Support multiple timeframes in parallel (1m, 3m, 5m, 15m).
+
+============================================================
+5. PROJECT STRUCTURE
+============================================================
+
+anjaneeya/
+│
+├── config/
+│   ├── settings.yaml
+│   ├── indicators.yaml
+│   ├── model.yaml
+│   ├── data_sources.yaml
+│   ├── option_universe.yaml
+│   └── calendar.yaml
+│
+├── core/                          # shared library (pure logic)
+│   ├── __init__.py
+│   ├── config_loader.py
+│   ├── logging_setup.py
+│   ├── schemas.py                 # pydantic data contracts
+│   ├── market_calendar/
+│   │   └── nse_calendar.py
+│   ├── indicators/
+│   │   ├── moving_averages.py
+│   │   ├── momentum.py
+│   │   ├── volatility.py
+│   │   └── statistics.py
+│   ├── nifty/
+│   │   ├── trend_engine.py
+│   │   └── regime_engine.py
+│   ├── options/
+│   │   ├── option_selector.py
+│   │   ├── option_trend_engine.py
+│   │   ├── option_context.py
+│   │   └── greeks_calculator.py
+│   ├── price_action/
+│   │   ├── candle_engine.py
+│   │   ├── level_engine.py
+│   │   ├── interaction_engine.py
+│   │   └── structure_engine.py
+│   ├── features/
+│   │   ├── feature_builder.py
+│   │   └── feature_validator.py
+│   ├── labels/
+│   │   └── label_builder.py
+│   ├── ml/
+│   │   ├── dataset_builder.py
+│   │   ├── splitter.py            # purged walk-forward
+│   │   ├── trainer.py
+│   │   ├── predictor.py
+│   │   ├── evaluator.py
+│   │   └── explainer.py
+│   ├── backtest/
+│   │   ├── engine.py
+│   │   ├── execution_model.py
+│   │   ├── metrics.py
+│   │   └── analysis.py            # time-of-day / DOW / DTE analysis
+│   └── visualization/
+│       ├── charts.py
+│       └── reports.py
+│
+├── apps/
+│   ├── anjaneeya_capture/         # APP 1
+│   │   ├── run.py
+│   │   ├── zerodha_auth.py
+│   │   ├── zerodha_client.py
+│   │   ├── rate_limiter.py
+│   │   ├── nifty_index_fetcher.py
+│   │   ├── websocket_listener.py
+│   │   ├── option_chain_poller.py
+│   │   ├── storage_writer.py
+│   │   └── heartbeat.py
+│   │
+│   ├── anjaneeya_engine/          # APP 2
+│   │   ├── run.py
+│   │   ├── candle_builder.py
+│   │   ├── feature_pipeline.py
+│   │   └── validation_runner.py
+│   │
+│   └── anjaneeya_ai/              # APP 3
+│       ├── run.py
+│       ├── dataset_job.py
+│       ├── training_job.py
+│       ├── prediction_job.py
+│       ├── backtest_job.py
+│       ├── analysis_job.py
+│       └── report_job.py
+│
+├── data/
+│   ├── raw/
+│   │   ├── nifty_index/
+│   │   ├── ticks/
+│   │   └── option_chain_snapshots/
+│   ├── candles/
+│   ├── features/
+│   ├── labels/
+│   ├── datasets/
+│   ├── models/
+│   ├── predictions/
+│   ├── backtests/
+│   └── reports/
+│
+├── db/
+│   └── anjaneeya.duckdb           # local analytical DB
+│
+├── scripts/
+│   ├── install.sh / install.ps1
+│   ├── daily_login.sh
+│   ├── start_capture.sh
+│   ├── run_feature_engine.sh
+│   ├── run_ai_engine.sh
+│   └── health_check.py
+│
+├── tests/
+├── notebooks/
+├── README.md
+├── requirements.txt (or pyproject.toml)
+└── .env.example
+
+============================================================
+6. DATA MODEL
+============================================================
+
+6.1 NIFTY Index
+timestamp, open, high, low, close, volume, oi, source
+
+6.2 Options (raw tick)
+timestamp, instrument_token, tradingsymbol, expiry, strike, option_type,
+last_price, bid, ask, bid_qty, ask_qty, volume, oi, iv (if available),
+source
+
+6.3 Options (candle)
+timestamp, expiry, strike, option_type, open, high, low, close, volume,
+oi, iv, delta, gamma, theta, vega, days_to_expiry, distance_from_atm
+
+6.4 Contract Identity
+Always identified by: underlying + expiry + strike + option_type.
+Never calculate indicators across different contracts.
+
+6.5 Provenance
+Every row carries: source, fetch_timestamp, quality_flag, run_id.
+
+6.6 Timezone
+Asia/Kolkata everywhere. Timezone-aware timestamps. Never naive.
+
+============================================================
+7. MARKET CALENDAR AND EXPIRY HANDLING
+============================================================
+
+Dedicated `core/market_calendar/nse_calendar.py`:
+- NSE trading holidays (configurable, updatable yearly).
+- Special sessions.
+- Weekly and monthly expiry rules (configurable — do NOT hard-code
+  Thursday/Tuesday; NSE changes them).
+- Expiry rollover rules.
+- Half-day sessions.
+
+days_to_expiry: configurable definition (calendar days / trading days /
+minutes-to-1530-close). Document the choice.
+
+Expiry-cycle phase (for RQ1):
+- START_OF_CYCLE: first trading day after previous expiry.
+- MID_CYCLE: middle trading days of the cycle.
+- EXPIRY_DAY: the expiry date itself.
+Configurable boundaries.
+
+Time-of-day buckets (for RQ2), configurable, default:
+- OPEN_915_930
+- MORNING_930_1100
+- MIDDAY_1100_1300
+- AFTERNOON_1300_1430
+- CLOSE_1430_1515
+
+============================================================
+8. NIFTY TREND ENGINE
+============================================================
+
+Full MA combinations calculated on NIFTY index only.
+
+COMBINATION 1:
+EMA 8 Low, EMA 8 High, SMA 108 High, SMA 180 High,
+EMA 254 Close, SMA 720 High, SMA 1080 Close, SMA 2056 High
+
+COMBINATION 2:
+EMA 8 Low, EMA 8 High, EMA 144 High, SMA 89 High,
+EMA 55 Close, EMA 360 High
+
+COMBINATION 3:
+EMA 20 Close, EMA 200 Close
+
+For every relevant MA compute:
+- price above/below
+- MA slope
+- normalized slope: (MA[t] - MA[t-k]) / (ATR[t] * k)
+- MA alignment
+- MA separation/spread: (fast_MA - slow_MA) / ATR
+- spread velocity: spread[t] - spread[t-k]
+- persistence
+
+All k values configurable.
+
+============================================================
+9. NIFTY TREND SCORES AND REGIME
+============================================================
+
+Scores: fast_score, medium_score, long_score, composite_trend_score.
+
+Initial weights (configurable, NOT optimal):
+fast 0.40, medium 0.35, long 0.25.
+
+Also compute: trend_acceleration, trend_persistence.
+
+Regime states:
+STRONG_BULLISH, BULLISH, BULLISH_DEVELOPING, NEUTRAL,
+BEARISH_DEVELOPING, BEARISH, STRONG_BEARISH.
+
+Do NOT emit BUY/SELL from this engine. It describes conditions only.
+
+============================================================
+10. OPTION TREND ENGINE
+============================================================
+
+Lightweight, applied per option contract.
+Do NOT apply NIFTY long-period MAs to weekly options.
+
+MAs: EMA 8 Low, EMA 8 High, EMA 20 Close, EMA 55 Close, EMA 200 Close
+(all configurable).
+
+Compute:
+option_ma_alignment, option_ma_slope, option_normalized_slope,
+EMA20_EMA200_spread, spread_velocity, ATR, momentum, trend_persistence.
+
+Handle insufficient history explicitly (weekly options often lack
+enough candles for EMA 200). Configurable behavior: flag / skip / use
+shorter window.
+
+============================================================
+11. CANDLE BEHAVIOUR ENGINE
+============================================================
+
+For every candle compute:
+body, range, upper_wick, lower_wick,
+body_ratio, upper_wick_ratio, lower_wick_ratio, direction.
+
+body       = abs(close - open)
+range      = high - low
+upper_wick = high - max(open, close)
+lower_wick = min(open, close) - low
+
+Protect against division by zero.
+
+Numerical relationships with previous candle:
+gap, engulf_ratio, inside_flag, outside_flag, body_ratio_change,
+wick_ratio_change, close_position_within_prev_range.
+
+Detect (numerically, not only by name):
+strong bullish/bearish, small body, long wick, inside, outside,
+bullish engulfing, bearish engulfing, rejection, breakout.
+
+Store the numeric measurements as ML features — names are secondary.
+
+============================================================
+12. DAILY AND PREVIOUS-DAY LEVELS
+============================================================
+
+For every contract and NIFTY compute:
+today_open, today_high, today_low, today_close,
+previous_day_close, previous_day_high, previous_day_low,
+previous_day_open.
+
+Distance features (ATR-normalized where appropriate):
+distance_to_today_high, distance_to_today_low,
+distance_to_previous_day_high, distance_to_previous_day_low.
+
+STRICT RULE: at timestamp T, "today_high" means the running high up to
+T, not the day's final high. Same for low. Previous-day values must be
+computed only from days fully closed before T.
+
+This rule is non-negotiable and must have a dedicated leakage test.
+
+============================================================
+13. PRICE LEVEL INTERACTION ENGINE
+============================================================
+
+Event/state engine for important levels.
+
+States:
+NOT_TESTED, APPROACHING, TOUCHED, CROSSED_ABOVE, CROSSED_BELOW,
+CLOSED_ABOVE, CLOSED_BELOW, HELD_ABOVE, HELD_BELOW, REJECTED,
+RETESTED, FAILED_BREAKOUT, FAILED_BREAKDOWN.
+
+Example (Previous Day High = 150):
+149 → 151 → 152 → 151 → 153
+Must detect: approach, touch, cross above, close above, hold above,
+retest, continuation.
+
+Example:
+149 → 151 → 148 → 147
+Must detect: break above, rejection, failed breakout, back below.
+
+Equivalent logic for support.
+
+Each event is timestamped and non-repainting.
+
+============================================================
+14. SUPPORT AND RESISTANCE ENGINE
+============================================================
+
+Candidate levels from:
+previous day high/low, today high/low (running), previous close,
+today open, recent swing highs/lows, local extremes.
+
+For each candidate compute:
+number_of_touches, rejection_count, breakout_count,
+failed_breakout_count, breakdown_count, failed_breakdown_count,
+retest_count, distance_from_current_price, reaction_strength.
+
+Then compute configurable numerical support_strength and
+resistance_strength.
+
+These are analytical features. Do not auto-convert into trading signals.
+
+============================================================
+15. MARKET STRUCTURE ENGINE
+============================================================
+
+Detect Higher High, Higher Low, Lower High, Lower Low using
+configurable swing detection.
+
+Structural states:
+BULLISH_STRUCTURE, BEARISH_STRUCTURE, RANGE, TRANSITION.
+
+Also compute:
+current_swing_high, current_swing_low,
+distance_from_swing_high, distance_from_swing_low.
+
+Swing confirmation delay must be explicit. A swing is only "known" once
+enough subsequent candles exist. This constraint must be enforced in
+feature generation — never use a swing that would only be confirmed in
+the future.
+
+============================================================
+16. OPTION CONTEXT ENGINE
+============================================================
+
+For each option compute:
+option_type, strike, expiry, days_to_expiry, distance_from_atm,
+expiry_cycle_phase, time_of_day_bucket.
+
+If available:
+IV, IV_change, delta, gamma, theta, vega, OI, OI_change, volume.
+
+If Zerodha does not provide Greeks, compute them internally using
+Black-Scholes (European, cash-settled). Document model, risk-free rate
+source, and dividend assumption.
+
+Relative behaviour:
+ExpectedOptionMove = Delta * NIFTYMove
+ActualOptionMove   = option_price[t] - option_price[t-1]
+OptionResidual     = ActualOptionMove - ExpectedOptionMove
+
+Document limitations of this approximation.
+
+============================================================
+17. OPTION SELECTION
+============================================================
+
+Initial universe per expiry:
+ATM-100 CE, ATM CE, ATM+100 CE
+ATM-100 PE, ATM PE, ATM+100 PE
+
+Strike distance configurable. Later expandable to:
+ATM-100, ATM-50, ATM, ATM+50, ATM+100.
+
+ATM definition (spot vs futures, strike interval) configurable.
+
+Do not assume the best strike beforehand.
+
+============================================================
+18. UNIFIED FEATURE ENGINE
+============================================================
+
+One feature row per (timestamp, option contract).
+
+Feature groups:
+NIFTY:      trend scores, regime, acceleration, persistence
+OPTION:     trend score, MA alignment, slopes, spread, spread velocity,
+            ATR, momentum
+CANDLE:     body_ratio, wick ratios, direction, range,
+            previous_candle_relationship
+LEVELS:     distances to today/prev-day highs and lows
+LEVEL_EVENTS: touched/crossed/closed/rejected/broke/held flags
+STRUCTURE:  HH/HL/LH/LL, market_structure state
+S/R:        support_strength, resistance_strength, touch/rejection counts
+CONTEXT:    option_type, strike, distance_from_atm, days_to_expiry,
+            expiry_cycle_phase, time_of_day_bucket,
+            IV, IV_change, delta, gamma, theta, vega, OI, OI_change
+RELATIVE:   expected_option_move, actual_option_move, option_residual
+
+Feature names must be stable, documented, and versioned.
+
+============================================================
+19. FEATURE VALIDATION
+============================================================
+
+Validate:
+- missing values, infinite values
+- duplicate (timestamp, contract) rows
+- invalid OHLC (high<low, close outside range)
+- negative volume, invalid strike, invalid expiry, invalid option_type
+- timestamp ordering, gaps
+- future leakage (features must not reference future rows)
+
+Produce a validation report per run. Never silently drop.
+
+============================================================
+20. LABELS
+============================================================
+
+Do NOT train the model to output BUY/SELL directly.
+
+Predict future behaviour over configurable horizons (5, 10, 15, 30
+minutes; multiple horizons supported):
+
+future_return, future_max_up_move, future_max_down_move,
+future_trend_change.
+
+Classification labels (configurable thresholds, ATR- or
+volatility-normalized):
+UP_CONTINUATION, DOWN_CONTINUATION, RANGE, REVERSAL.
+
+Strict separation between feature generation and label generation.
+Labels must never appear as features.
+
+============================================================
+21. ML MODEL
+============================================================
+
+Start with LightGBM (fallback: XGBoost).
+Model outputs class probabilities.
+
+Components:
+- dataset_builder
+- splitter (purged walk-forward with embargo = max horizon)
+- trainer
+- predictor
+- evaluator
+- explainer (native importance, permutation, SHAP optional)
+
+Add probability calibration metrics: log loss, Brier score,
+reliability curves.
+
+Compare against naive baselines:
+- always-up
+- always-range
+- random
+- NIFTY-regime-only
+
+Keep the interface generic so a future model can be swapped in.
+
+============================================================
+22. TIME-SERIES VALIDATION (MANDATORY)
+============================================================
+
+Never shuffle financial time-series data.
+
+Use PURGED WALK-FORWARD VALIDATION with an embargo equal to the maximum
+label horizon. All scaling, encoding and feature selection must be fit
+on training folds only.
+
+Keep a final untouched holdout period. Never touch it during tuning.
+
+Document every split precisely, including exact timestamps.
+
+============================================================
+23. BACKTESTER
+============================================================
+
+Only build the backtester after the feature engine is stable.
+
+Support:
+entry, exit, stop loss, target, time-based exit,
+transaction cost, brokerage, slippage, bid/ask spread.
+
+Execution model:
+- signals generated at candle close T
+- execution at T+1 open or bid/ask (configurable)
+- configurable latency
+
+Indian cost model:
+brokerage, STT, exchange charges, GST, stamp duty, SEBI charges,
+slippage, plus optional bid/ask spread from captured data.
+
+Trade record includes:
+timestamp, option, expiry, strike, option_type,
+entry_price, exit_price, entry_reason, exit_reason,
+NIFTY state, option state, candle state,
+support/resistance state, AI prediction, AI probabilities,
+P&L, MFE, MAE, holding_time, time_of_day_bucket, expiry_cycle_phase.
+
+Never hide losing trades.
+
+============================================================
+24. TIME-OF-DAY / EXPIRY-CYCLE ANALYSIS (KEY DELIVERABLE)
+============================================================
+
+This is ANJANEYA's primary research output. The ANJANEYA-AI app must
+produce:
+
+1. Performance matrix by time_of_day_bucket × option_type (CE / PE).
+2. Performance matrix by time_of_day_bucket × expiry_cycle_phase.
+3. Performance by day_of_week.
+4. Performance by days_to_expiry.
+5. Interaction tables: regime × time-of-day, regime × cycle phase.
+6. Holding-time distribution by bucket.
+7. Volatility (ATR) profile by bucket and cycle phase.
+8. Intraday path analysis: average cumulative return curve per bucket.
+9. Statistical significance of any apparent edge (with correction for
+   multiple testing).
+10. Clear PRELIMINARY labels when sample size is below configured
+    thresholds.
+
+The user's core question — "which time between 09:15 and 15:15 is best
+for trading, and how does this depend on expiry cycle phase" — must be
+answered numerically, not narratively.
+
+============================================================
+25. METRICS
+============================================================
+
+Overall:
+total trades, winners, losers, win rate, average win, average loss,
+profit factor, max drawdown, average holding time, total return,
+return distribution, Sharpe-like ratio, exposure.
+
+Segmented:
+by expiry, by strike distance, CE vs PE, by time-of-day, by regime,
+by expiry_cycle_phase, by day-of-week.
+
+Do not optimize solely for win rate.
+
+============================================================
+26. EXPLAINABILITY
+============================================================
+
+Every prediction must be explainable in plain structured form:
+
+NIFTY:  Trend, Trend Score, Acceleration
+OPTION: Trend, Momentum
+PRICE ACTION: level states, breakout/retest status
+CANDLE: body ratio, wick ratios, range
+S/R: support/resistance strength
+CONTEXT: time_of_day_bucket, expiry_cycle_phase, days_to_expiry
+AI: top class probabilities
+
+Values are examples only. Do not hard-code.
+
+============================================================
+27. FEATURE IMPORTANCE
+============================================================
+
+After training, generate:
+native importance, permutation importance, optional SHAP.
+
+Determine whether predictive information comes from:
+NIFTY regime, option MA, candle behaviour, S/R, structure,
+IV, Greeks, OI, option residual, time-of-day, cycle phase,
+time to expiry.
+
+Do not assume. Measure. Report with confidence intervals where
+practical.
+
+============================================================
+28. VISUALIZATION
+============================================================
+
+Charts must be produced for validation.
+
+NIFTY: price, MA lines, trend score, regime.
+Options: price, EMA8 High, EMA8 Low, EMA20, EMA55, EMA200.
+Overlays: today high/low (running), previous-day high/low, support,
+resistance, breakout/rejection markers, structure labels,
+AI prediction.
+
+Research charts:
+- heatmap: time-of-day × cycle phase P&L
+- heatmap: time-of-day × day-of-week
+- CE vs PE intraday P&L curves
+- regime-conditional performance
+- feature importance bars
+
+Visualization is not optional.
+
+============================================================
+29. TESTING
+============================================================
+
+pytest for every major module. Required tests include:
+
+test_moving_averages, test_slope, test_spread, test_spread_velocity,
+test_atr, test_candle_features, test_daily_levels,
+test_previous_day_levels, test_breakout_detection,
+test_failed_breakout, test_support_detection, test_resistance_detection,
+test_market_structure, test_option_residual, test_expiry_handling,
+test_feature_generation, test_label_generation, test_no_lookahead,
+test_tick_storage, test_candle_builder, test_rate_limiter.
+
+Edge cases:
+first candle of day, market open, market close, missing candles,
+duplicate candles, zero-range candles, expiry day, contract rollover,
+missing Greeks, missing IV, missing OI, WebSocket reconnect mid-candle.
+
+Dedicated leakage tests are mandatory.
+
+============================================================
+30. NO LOOK-AHEAD BIAS RULE
+============================================================
+
+At timestamp T, only information available at or before T may be used.
+
+- Do not use today's final high at 10:00 if it happened at 14:30.
+- Do not use today's final low before it happened.
+- Do not use future swing confirmation as if it were known earlier.
+- Do not use future option prices.
+- Do not include label fields as features.
+
+Feature generation and label generation must be physically separated in
+code and in the resulting datasets.
+
+============================================================
+31. CONFIGURATION
+============================================================
+
+Everything configurable via YAML.
+
+Example skeleton:
+
+settings.yaml:
+  project_name: ANJANEYA
+  timeframe: 5m
+  timezone: Asia/Kolkata
+  data_root: ./data
+
+data_sources.yaml (zerodha block):
+  api_key_env: ZERODHA_API_KEY
+  api_secret_env: ZERODHA_API_SECRET
+  user_id_env: ZERODHA_USER_ID
+  totp_key_env: ZERODHA_TOTP_KEY
+  rate_limits:
+    quote_per_second: 1
+    historical_per_second: 3
+    other_per_second: 10
+
+option_universe.yaml:
+  strikes_offset: [-100, 0, 100]
+  expiries: [current_week, next_week]
+  atm_reference: spot
+  strike_interval: 50
+
+indicators.yaml:
+  atr_period: 14
+  slope_k: 5
+
+model.yaml:
+  algorithm: lightgbm
+  horizons_minutes: [5, 10, 15, 30]
+  min_days_required: 60
+  walk_forward:
+    train_window_days: 90
+    validate_window_days: 15
+    embargo_minutes: 30
+  costs:
+    brokerage_per_order: 20
+    slippage_bps: 5
+
+calendar.yaml:
+  weekly_expiry_weekday: Thursday
+  time_of_day_buckets:
+    - [09:15, 09:30]
+    - [09:30, 11:00]
+    - [11:00, 13:00]
+    - [13:00, 14:30]
+    - [14:30, 15:15]
+
+Do not hard-code any of these.
+
+============================================================
+32. DEVELOPMENT PHASES
+============================================================
+
+Follow exactly. Stop after each phase and wait for approval.
+
+PHASE 1 — Foundation
+  Repo skeleton (3 apps + core), config files, logging, DuckDB setup,
+  pydantic schemas, market calendar stub, Zerodha auth module with TOTP,
+  rate limiter, pytest scaffolding, README, .env.example.
+  No trading logic.
+
+PHASE 2 — ANJANEYA-CAPTURE
+  NIFTY historical backfill, daily top-up, WebSocket listener with
+  reconnect, tick storage, option chain poller, heartbeat, daily token
+  refresh script. Manual smoke test against live market.
+
+PHASE 3 — Candle Builder
+  Ticks → OHLCV candles at configured timeframes for NIFTY and options.
+  Gap handling, first/last candle rules, missing-tick handling.
+
+PHASE 4 — Indicators Library
+  MAs (EMA low/high, SMA, EMA close), ATR, slopes, spreads,
+  spread velocity, momentum, volatility, basic statistics.
+
+PHASE 5 — NIFTY Trend and Regime Engine
+  All MA combinations, scores, composite, acceleration, persistence,
+  regime states.
+
+PHASE 6 — Option Trend Engine (lightweight).
+
+PHASE 7 — Candle Behaviour Engine.
+
+PHASE 8 — Daily / Previous-Day Level Engine.
+
+PHASE 9 — Level Interaction Engine
+  State machine, events, non-repainting.
+
+PHASE 10 — Support/Resistance Engine.
+
+PHASE 11 — Market Structure Engine.
+
+PHASE 12 — Option Context Engine
+  Greeks calculator (Black-Scholes), IV/OI handling, residual.
+
+PHASE 13 — Unified Feature Engine
+  Combine all engines into the feature table.
+
+PHASE 14 — Feature Validation
+  Full validation framework + report.
+
+PHASE 15 — Labels
+  Future returns, max moves, trend change, classification labels.
+
+PHASE 16 — ML Dataset Builder
+  Join features + labels, purge/embargo, splitter, dataset artifacts.
+
+PHASE 17 — First ML Model
+  LightGBM baseline, baseline comparisons, calibration.
+
+PHASE 18 — Walk-Forward Validation
+  Purged folds, holdout, reporting.
+
+PHASE 19 — Backtester
+  Execution model, Indian cost model, trade ledger, metrics.
+
+PHASE 20 — Time-of-Day / Cycle-Phase Analysis
+  Heatmaps, intraday curves, statistical significance, preliminary
+  flags when data is insufficient.
+
+PHASE 21 — Explainability
+  Per-prediction structured explanations.
+
+PHASE 22 — Visualization
+  NIFTY + option charts, event overlays, research charts.
+
+PHASE 23 — Feature Importance
+  Native + permutation + optional SHAP.
+
+PHASE 24 — Decision Layer (later, separate)
+  Only after features, model and backtest are validated.
+
+PHASE 25 — Continuous Data Accumulation Reports
+  Weekly summary of data captured, coverage, gaps, sample sizes,
+  readiness for retraining.
+
+============================================================
+33. PHASE COMPLETION CHECKLIST
+============================================================
+
+At the end of each phase provide:
+1.  Files created
+2.  Files modified
+3.  What was implemented
+4.  Configuration added
+5.  Tests created
+6.  Test results (actual output)
+7.  Example output (small, real)
+8.  Known limitations
+9.  Assumptions made
+10. Next phase will implement
+
+Do not start the next phase without explicit approval.
+
+============================================================
+34. DO NOT OPTIMIZE TOO EARLY
+============================================================
+
+Do not tune MA periods, weights, thresholds, stop loss, take profit,
+prediction cutoffs, or strike selection up front.
+
+Build a correct baseline. Then run controlled experiments. Every
+optimization must be evaluated with walk-forward historical testing on
+data not used to select parameters.
+
+Never select parameters on the same data used to evaluate them.
+
+============================================================
+35. RESEARCH MINDSET
+============================================================
+
+The purpose of ANJANEYA is to discover whether NIFTY regime,
+option trend, candle behaviour, support/resistance, market structure,
+Greeks/IV/OI, and relative option behaviour — taken together — contain
+useful predictive information for NIFTY weekly options.
+
+Do not assume any feature is profitable.
+Do not assume any MA combination is optimal.
+Do not assume any candle pattern is predictive.
+Do not assume support/resistance "works."
+Do not assume any time-of-day is best.
+
+Measure everything. Report honestly, including negative results.
+
+============================================================
+36. REPRODUCIBILITY AND RUN TRACKING
+============================================================
+
+Every run records:
+  run_id (timestamp + uuid)
+  config snapshot hash
+  git commit hash
+  data version / coverage window
+  random seeds
+  environment (python version, key packages)
+  output artifacts (models, predictions, metrics, charts)
+
+Structured logging to file + console. Health checks in scripts/.
+
+============================================================
+37. FIRST TASK
+============================================================
+
+Do NOT implement the entire project now.
+Start ONLY with PHASE 1.
+
+PHASE 1 deliverables:
+1.  Inspect the existing repository.
+2.  Do not overwrite working code.
+3.  Propose the final ANJANEYA project structure (3 apps + core + tests).
+4.  Create all config files with sensible, documented defaults.
+5.  Create the `core/` package skeleton (empty modules with docstrings,
+    no logic yet).
+6.  Create the three `apps/*/run.py` entry point stubs:
+      - apps/anjaneeya_capture/run.py
+      - apps/anjaneeya_engine/run.py
+      - apps/anjaneeya_ai/run.py
+7.  Create the logging setup and structured logger.
+8.  Create the pydantic schemas for tick, candle, feature, label rows.
+9.  Create the market calendar stub with a configurable holiday list.
+10. Implement the Zerodha authentication module (TOTP-based login,
+    token persistence, daily refresh helper).
+11. Implement the token-bucket rate limiter.
+12. Create the DuckDB bootstrap (schema creation, no data).
+13. Create pytest structure with at least one smoke test per module.
+14. Create README describing ANJANEYA's 3-app architecture and data
+    strategy.
+15. Create .env.example with placeholder Zerodha credentials.
+16. Create scripts/ (start_capture, run_feature_engine, run_ai_engine,
+    daily_login, health_check).
+
+Do NOT implement any indicator, trend, feature, or ML logic yet.
+
+At the end of PHASE 1, output:
+  - the ANJANEYA project tree
+  - the list of files created/modified
+  - the config contents
+  - pytest results
+  - assumptions
+  - open questions
+  - then STOP.
+
+Do not begin Phase 2 until explicitly approved.
+
+============================================================
+FINAL RULE
+============================================================
+
+Accuracy and correctness are more important than speed.
+
+Build ANJANEYA as a research-quality system, not a fake AI trading bot.
+
+Every calculation must be explainable.
+Every model must be evaluated chronologically.
+Every feature must be checked for look-ahead bias.
+Every assumption must be documented.
+Every phase must have tests.
+Every data capture must be safe to run unattended.
+
+Start with PHASE 1 only.

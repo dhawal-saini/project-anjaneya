@@ -1,0 +1,165 @@
+# ===========================================================================
+# ANJANEYA - indicator / engine parameters
+# ===========================================================================
+# NOTE: nothing in this file is "optimal". These are documented STARTING
+# BASELINES. Do not tune them before a correct baseline exists, and never
+# tune on the same data used to evaluate (see master spec section 34).
+# ===========================================================================
+
+# --- shared windows ---------------------------------------------------------
+slope:
+  # Slope lookback k: normalized_slope[t] = (MA[t] - MA[t-k]) / (ATR[t] * k)
+  k: 5
+
+persistence:
+  # How many recent bars must agree for trend_persistence to be 1.0.
+  window: 5
+
+spread_velocity:
+  # spread_velocity[t] = spread[t] - spread[t-k]
+  k: 5
+
+momentum:
+  # momentum[t] = (close[t] - close[t-period]) / ATR[t] - ATR-normalised, so a
+  # NIFTY move and a 25000-strike option move are the same kind of number.
+  period: 10
+
+atr:
+  period: 14
+  # wilder (RMA, as in Wilder's original ATR) | simple
+  method: wilder
+
+# --- NIFTY moving-average combinations (section 8) --------------------------
+# `source` = which OHLC field the MA is computed on (open/high/low/close).
+# `role`   = fast | medium | long, drives the score aggregation.
+nifty_moving_averages:
+  combination_1:
+    - { name: ema_8_low,     type: ema, period: 8,    source: low,   role: fast }
+    - { name: ema_8_high,    type: ema, period: 8,    source: high,  role: fast }
+    - { name: sma_108_high,  type: sma, period: 108,  source: high,  role: medium }
+    - { name: sma_180_high,  type: sma, period: 180,  source: high,  role: medium }
+    - { name: ema_254_close, type: ema, period: 254,  source: close, role: long }
+    - { name: sma_720_high,  type: sma, period: 720,  source: high,  role: long }
+    - { name: sma_1080_close, type: sma, period: 1080, source: close, role: long }
+    - { name: sma_2056_high, type: sma, period: 2056, source: high,  role: long }
+  combination_2:
+    - { name: ema_8_low,     type: ema, period: 8,    source: low,   role: fast }
+    - { name: ema_8_high,    type: ema, period: 8,    source: high,  role: fast }
+    - { name: ema_144_high,  type: ema, period: 144,  source: high,  role: medium }
+    - { name: sma_89_high,   type: sma, period: 89,   source: high,  role: medium }
+    - { name: ema_55_close,  type: ema, period: 55,   source: close, role: medium }
+    - { name: ema_360_high,  type: ema, period: 360,  source: high,  role: long }
+  combination_3:
+    - { name: ema_20_close,  type: ema, period: 20,   source: close, role: fast }
+    - { name: ema_200_close, type: ema, period: 200,  source: close, role: long }
+
+# --- NIFTY trend scores (section 9) ----------------------------------------
+nifty_scores:
+  # Initial weights. NOT optimal - baseline only.
+  weights:
+    fast: 0.40
+    medium: 0.35
+    long: 0.25
+  # Composite score -> regime thresholds (score is in [-1, +1]).
+  regime_thresholds:
+    strong_bullish: 0.60
+    bullish: 0.25
+    bullish_developing: 0.08
+    bearish_developing: -0.08
+    bearish: -0.25
+    strong_bearish: -0.60
+
+# --- option trend engine (section 10) --------------------------------------
+# Deliberately lightweight: weekly options do not live long enough for
+# NIFTY-style long-period MAs.
+option_trend:
+  moving_averages:
+    - { name: ema_8_low,     type: ema, period: 8,   source: low }
+    - { name: ema_8_high,    type: ema, period: 8,   source: high }
+    - { name: ema_20_close,  type: ema, period: 20,  source: close }
+    - { name: ema_55_close,  type: ema, period: 55,  source: close }
+    - { name: ema_200_close, type: ema, period: 200, source: close }
+  # Weekly options often lack enough candles for EMA 200.
+  # flag   -> compute what is possible and mark insufficient history
+  # skip   -> drop the row for that MA
+  # shorter_window -> fall back to the longest available period
+  insufficient_history_policy: flag
+  min_candles_for_full_set: 200
+  # Which two of the averages above `option_ema20_ema200_spread` is measured
+  # between. The stored column name is fixed by spec 18, so the pair is named
+  # explicitly here rather than guessed from the stack (the stack also carries
+  # EMA 8 low/high, and "fastest minus slowest" would have meant EMA 8 - EMA 200).
+  spread_pair:
+    fast: ema_20_close
+    slow: ema_200_close
+
+# --- candle behaviour engine (section 11) ----------------------------------
+candle:
+  # Guards against division by zero on zero-range candles.
+  epsilon: 1.0e-9
+  # A body is "small" if body_ratio < this, "long" wick if wick_ratio > that.
+  small_body_ratio: 0.25
+  long_wick_ratio: 0.50
+  # Engulfing: current body must cover the previous body by at least this much.
+  engulf_min_ratio: 1.0
+
+# --- levels / interaction / S-R / structure --------------------------------
+levels:
+  swing:
+    # A swing high/low needs `left_bars` lower/higher bars before it and
+    # `right_bars` after it. right_bars IS the confirmation delay: a swing is
+    # only "known" once that many bars exist - enforced in feature generation.
+    left_bars: 3
+    right_bars: 3
+    # Number of recent swings retained as candidate S/R levels.
+    max_swings: 10
+  interaction:
+    # ATR-normalized proximity thresholds (0.25 => within 25% of ATR).
+    approaching_atr_fraction: 0.25
+    touch_atr_fraction: 0.05
+    # Consecutive closes beyond a level required to call it HELD_*.
+    min_closes_to_hold: 2
+  support_resistance:
+    # Configurable strength formula weights (all normalized to [0, 1]).
+    weights:
+      touches: 0.30
+      rejections: 0.25
+      holds: 0.20
+      recency: 0.15
+      distance: 0.10
+
+# --- option IV / greeks model (section 16, Stage 3.3) ----------------------
+# Black-Scholes-Merton, European, cash-settled - the model spec 16 names when
+# Zerodha does not hand over greeks. EVERY value below is a documented
+# assumption that is recorded in the run summary: an IV is only comparable
+# across runs when the rate, the dividend assumption and the time convention
+# that produced it are identical.
+greeks:
+  model: black_scholes
+  # Annualised, continuously compounded. NOT fetched from a curve: a rate that
+  # changes silently between runs would silently change every stored IV.
+  # 6.5% is the documented baseline (India 10y G-Sec, rounded) - revisit
+  # deliberately, and record the change in docs/phase_reports/phase_03.md.
+  risk_free_rate: 0.065
+  # Continuous dividend yield of the underlying. 0.0 = dividends are ignored
+  # (NIFTY options are priced off the index; the index's dividends are not
+  # observable tick by tick). Documented limitation, see the phase report.
+  dividend_yield: 0.0
+  # Which candle field the IV is solved from:
+  #   close -> the bar's last traded price (same price actual_option_move uses)
+  #   hl2   -> (high + low) / 2      (a crude mid, for illiquid strikes)
+  #   ohlc4 -> (open + high + low + close) / 4
+  price_field: close
+  # ACT/365: time_to_expiry is (expiry session end - bar close) / 365 days.
+  year_days: 365
+  # Floor on the time to expiry, in minutes. One session (09:15-15:30) is the
+  # documented floor: without it the last bars of an expiry day divide by ~zero
+  # and report an IV that is really float noise.
+  min_time_to_expiry_minutes: 375.0
+  # IV search bracket in annualised vol units (0.005 = 0.5%, 5.0 = 500%).
+  # A price outside the bracket has no IV here -> the column stays NULL.
+  volatility_floor: 0.005
+  volatility_ceiling: 5.0
+  # Bisection stops once the bracket is narrower than this (vol units).
+  iv_tolerance: 0.000001
+  iv_max_iterations: 100
