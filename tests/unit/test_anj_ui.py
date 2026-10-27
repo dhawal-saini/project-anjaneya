@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -183,6 +184,18 @@ def test_the_post_close_topup_is_the_index_mode_not_the_overnight_history() -> N
     assert anj_ui.index_topup_argv(common=["--config-dir", "cfg"])[-2:] == ["--config-dir", "cfg"]
 
 
+def test_the_index_study_button_runs_the_engine_and_nothing_else() -> None:
+    """P1 must be one read-only engine mode: no network, no model, no database write."""
+    argv = anj_ui.index_study_argv()
+
+    assert argv == ["-m", anj_ui.ENGINE_APP, "--mode", "index-study"]
+    assert anj_ui.ENGINE_APP == "apps.anjaneeya_engine.run"
+    assert anj_ui.index_study_argv(common=["--config-dir", "cfg"])[-2:] == [
+        "--config-dir",
+        "cfg",
+    ]
+
+
 def test_the_playbook_exists_where_the_console_reads_it() -> None:
     """The Playbook tab renders this file; a rename must break a test, not the page."""
     assert anj_ui.PLAYBOOK.name == "daily-playbook.md"
@@ -190,6 +203,75 @@ def test_the_playbook_exists_where_the_console_reads_it() -> None:
     text = anj_ui.PLAYBOOK.read_text(encoding="utf-8")
     assert "## 1. Morning" in text
     assert "## 3. After the close" in text
+
+
+def test_the_live_helpers_read_and_write_files_only(tmp_path: Path) -> None:
+    """The Live tab must never touch DuckDB: heartbeat + flags are plain files."""
+    assert anj_ui.read_heartbeat(tmp_path) is None
+    assert anj_ui.heartbeat_age(None) is None
+
+    heartbeat = tmp_path / "runs" / "heartbeat" / "capture.json"
+    heartbeat.parent.mkdir(parents=True)
+    heartbeat.write_text(
+        json.dumps({"status": "RUNNING", "ticks_total": 5, "written_at": "2026-10-27T09:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    payload = anj_ui.read_heartbeat(tmp_path)
+    assert payload is not None and payload["ticks_total"] == 5
+    assert anj_ui.heartbeat_age(payload, now=datetime.fromisoformat("2026-10-27T09:00:30+00:00")) == 30.0
+    assert anj_ui.heartbeat_age({"written_at": "nonsense"}) is None
+
+    assert anj_ui.stop_requested(tmp_path) is False
+    assert anj_ui.request_stop(tmp_path).exists()
+    assert anj_ui.stop_requested(tmp_path) is True
+
+
+def test_the_pipeline_log_becomes_a_step_list() -> None:
+    text = "\n".join(
+        [
+            "[1/3] candles: ticks -> candles + the coverage ledger",
+            "    -> OK (12.3s)",
+            "[2/3] greeks: IV and greeks on the stored bars",
+            "    -> GATE (0.4s)",
+            "[3/3] features: the section-5 feature matrix",
+        ]
+    )
+
+    steps = anj_ui.parse_pipeline_log(text)
+
+    assert [item["step"] for item in steps] == ["candles", "greeks", "features"]
+    assert steps[0]["status"] == "ok" and steps[0]["seconds"] == 12.3
+    assert steps[1]["status"] == "gate"
+    assert steps[2]["status"] == "running" and steps[2]["seconds"] is None
+
+
+def test_the_repair_helpers_point_at_the_right_commands() -> None:
+    login = anj_ui.login_now_argv()
+    assert login[:3] == [anj_ui.LOGIN_AND_START, "--timeout", "240"]
+    assert "--no-start" in login  # login only; the session is started from Live
+
+    heal = anj_ui.backfill_options_argv(years=0.01)
+    assert heal[:4] == ["-m", anj_ui.CAPTURE_APP, "--mode", "backfill-options"]
+    assert heal[-1] == "0.01"
+
+
+def test_newest_artefacts_drive_the_readiness_card(tmp_path: Path) -> None:
+    reports = tmp_path / "reports" / "accumulation"
+    reports.mkdir(parents=True)
+    old = reports / "2026-10-01_accumulation.json"
+    new = reports / "2026-10-27_accumulation.json"
+    old.write_text(json.dumps({"captured_days": 4}), encoding="utf-8")
+    new.write_text(json.dumps({"captured_days": 49}), encoding="utf-8")
+    os.utime(old, (1, 1))
+
+    assert anj_ui.newest_file(reports, "*_accumulation.json") == new
+    assert anj_ui.read_accumulation(tmp_path)["captured_days"] == 49
+    assert anj_ui.newest_model(tmp_path) is None
+
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "1m_h5_2026-08-04_2026-10-27_lightgbm.txt").write_text("model", encoding="utf-8")
+    assert anj_ui.newest_model(tmp_path).name == "1m_h5_2026-08-04_2026-10-27_lightgbm.txt"
 
 
 def test_mask_hides_all_but_the_last_four() -> None:

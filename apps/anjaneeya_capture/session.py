@@ -20,6 +20,7 @@ Importing this module performs no I/O.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -910,6 +911,30 @@ class CaptureSession:
 
 
     # -- the monitor loop ---------------------------------------------------
+    #: Written by an operator (or the console) to stop a running session cleanly.
+    STOP_REQUEST_FILENAME = "stop.request"
+
+    @property
+    def stop_request_path(self) -> Path:
+        """Where a stop request is looked for (beside the heartbeat file)."""
+        return self.config.heartbeat_path().with_name(self.STOP_REQUEST_FILENAME)
+
+    def _stop_requested(self) -> bool:
+        """True once, when a stop-request file exists (it is removed when honoured).
+
+        The console runs a capture in a different process, so it cannot set
+        ``stop_event`` directly; a file is the smallest thing both sides can agree on.
+        Removing it on read means the next session starts from a clean slate.
+        """
+        path = self.stop_request_path
+        if not path.exists():
+            return False
+        with contextlib.suppress(OSError):  # vanished between exists() and unlink()
+            path.unlink()
+        if self.logger is not None:
+            self.logger.info("stop request accepted; finishing the session")
+        return True
+
     def _run_loop(
         self,
         *,
@@ -930,6 +955,8 @@ class CaptureSession:
                 f"({(deadline - self._now()).total_seconds() / 60:.1f} minutes)"
             )
         while self._now() < deadline:
+            if not self.stop_event.is_set() and self._stop_requested():
+                self.stop_event.set()
             if self.stop_event.is_set():
                 self._note(summary, "stop requested; shutting down cleanly")
                 break

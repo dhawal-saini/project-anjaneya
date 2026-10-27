@@ -189,6 +189,9 @@ class ConversionResult:
     out_of_session: int = 0
     suspect: int = 0
     unknown_tokens: int = 0
+    #: ``exchange - received`` for the last tick that carried an exchange stamp;
+    #: positive means the local clock is behind. Reported, never used to alter a bar.
+    clock_offset_seconds: float | None = None
     newest_timestamp: datetime | None = None
     newest_price: float | None = None
     newest_reference_price: float | None = None
@@ -253,6 +256,8 @@ def ticks_to_rows(
     in_session: Callable[[datetime], bool] | None = None,
     drop_out_of_session: bool = False,
     reference_token: int | None = None,
+    trust: str = "exchange",
+    tolerance_seconds: float = CLOCK_SKEW_TOLERANCE_SECONDS,
 ) -> ConversionResult:
     """Convert one tick message into storable rows.
 
@@ -263,8 +268,9 @@ def ticks_to_rows(
       ``last_trade_time``, else the local receive time (flagged ``SUSPECT``);
     * ``bid``/``ask``  -> top of ``depth`` (``None`` when a side is empty);
     * ``oi``           -> full-mode fields only (``None`` in ltp/quote modes);
-    * ``quality_flag`` -> ``OK``, ``SUSPECT`` (clock skew / missing exchange
-      time) or ``OUT_OF_SESSION`` (tick outside the NSE session).
+    * ``quality_flag`` -> ``OK``, ``SUSPECT`` (no exchange time, or - only when
+      ``clock_skew.trust`` is ``machine`` - an exchange stamp more than
+      ``tolerance_seconds`` ahead of the local clock) or ``OUT_OF_SESSION``.
     """
     target = tz or get_timezone(DEFAULT_TIMEZONE)
     session_check = in_session or (lambda moment: True)
@@ -300,11 +306,17 @@ def ticks_to_rows(
         )
         quality = QualityFlag.OK
         if exchange_time is None:
+            # No exchange timestamp at all: the receive clock is the only evidence,
+            # and it is exactly the clock we do not trust - so the row is flagged.
             quality = QualityFlag.SUSPECT
             timestamp = received_at
         else:
             timestamp = exchange_time
-            if (exchange_time - received_at).total_seconds() > CLOCK_SKEW_TOLERANCE_SECONDS:
+            result.clock_offset_seconds = (exchange_time - received_at).total_seconds()
+            # `trust="exchange"` (the default) only flags the *machine* clock: a tick
+            # carrying an exchange stamp is good regardless of how far the PC clock
+            # has drifted. `trust="machine"` keeps the old strict rule.
+            if trust == "machine" and result.clock_offset_seconds > tolerance_seconds:
                 quality = QualityFlag.SUSPECT
 
         if not session_check(timestamp):
@@ -497,6 +509,14 @@ class TickStream:
         self.mode = mode
         self.config = websocket_config
         self.capture = capture_config
+        skew = getattr(websocket_config, "clock_skew", None)
+        self._clock_trust = str(getattr(skew, "trust", "exchange"))
+        self._clock_tolerance = float(
+            getattr(skew, "tolerance_seconds", CLOCK_SKEW_TOLERANCE_SECONDS)
+        )
+        self._report_clock_offset = bool(getattr(skew, "report_offset", True))
+        #: Smoothed ``exchange - received`` in seconds (positive = local clock behind).
+        self.clock_offset_seconds: float | None = None
         self.writer = writer
         self.tracker = tracker
         self.heartbeat = heartbeat
@@ -667,7 +687,18 @@ class TickStream:
             in_session=self._is_open,
             drop_out_of_session=self.capture.out_of_session_ticks == "drop",
             reference_token=self.reference_token,
+            trust=self._clock_trust,
+            tolerance_seconds=self._clock_tolerance,
         )
+        if result.clock_offset_seconds is not None:
+            # Smooth it: a per-message value jitters by a second; the drift itself is
+            # slow, and the heartbeat is read by a human.
+            previous = self.clock_offset_seconds
+            self.clock_offset_seconds = (
+                result.clock_offset_seconds
+                if previous is None
+                else 0.9 * previous + 0.1 * result.clock_offset_seconds
+            )
         self.rejected += result.rejected
         self.suspect += result.suspect
         self.unknown_tokens += result.unknown_tokens
@@ -735,6 +766,11 @@ class TickStream:
             newest_price=price if price is not None else result.newest_price,
             gap_count=self.total_gaps,
             largest_gap_seconds=self.largest_gap_seconds,
+            clock_offset_seconds=(
+                round(self.clock_offset_seconds, 3)
+                if self._report_clock_offset and self.clock_offset_seconds is not None
+                else None
+            ),
         )
 
     def _log_progress(self) -> None:

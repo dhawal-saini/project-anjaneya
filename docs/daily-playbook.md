@@ -26,14 +26,12 @@ The session has to log in, resolve the option universe and top up the NIFTY inde
 *before* the open. The app then waits for 09:15 by itself
 (`capture.wait_for_session_open: true`, guard window 15 min).
 
-### Step 1 — one click: **Run → “Morning — browser login + capture”**
+### Step 1 — one click: **Token → “Login with browser”**, then **Live → “Start capture”**
 
-That single job does the whole morning:
-
-1. opens the Kite login in your browser (password + 2FA),
-2. catches the `request_token` on `http://127.0.0.1:5000/`,
-3. exchanges and **verifies** it (`profile()`), caching the token until 06:00 tomorrow,
-4. starts the capture, which waits for 09:15 and stops at 15:30.
+| Tab | What it does |
+| --- | --- |
+| **Token** | *Login with browser* opens the Kite login, catches the `request_token` on `http://127.0.0.1:5000/`, exchanges and **verifies** it, caching the token until 06:00 tomorrow. A *paste the token* box is the fallback. TOTP buttons appear only when `ZERODHA_TOTP_KEY` is set. |
+| **Live** | *Start capture* (browser login → capture, waits for 09:15, stops at 15:30) and *Stop capture* (a flag file the session checks every cycle, so it flushes and exits cleanly). Below them, a card that refreshes every 5 s: ticks, ticks/minute, snapshots, ATM, last tick, clock offset, gaps, reconnects. |
 
 If today's token is already cached and valid, the browser is skipped and the capture
 starts immediately — so pressing it twice is harmless.
@@ -101,11 +99,28 @@ the open, not after.
 
 Order matters. Step 1 feeds step 2.
 
-| # | What | Console | CLI |
+| # | What | Console (**Post-close** tab) | CLI |
 | --- | --- | --- | --- |
-| 1 | **Top up the NIFTY index** (network, seconds) | **Run** → *Top up index — NIFTY daily + 1m* | `pwsh ./scripts/run_backfill.ps1` |
-| 2 | **Rebuild the day** (offline) | **Run** → *Day — math only* | `uv run python scripts/anj.py day --no-capture` |
-| 3 | **Train / backtest / reports** (weekly or when ready) | **Run** → *Learn* | `uv run python scripts/anj.py learn` |
+| 1 | **Top up the NIFTY index** (network, seconds) | *1 - Top up NIFTY index* | `pwsh ./scripts/run_backfill.ps1` |
+| 2 | **Heal candles from REST** (only if a session started late / died) | *2 - Heal candles from REST* | `uv run python -m apps.anjaneeya_capture.run --mode backfill-options --years 0.01` |
+| 3 | **Rebuild the day** (offline) | *3 - Rebuild the day* | `uv run python scripts/anj.py day --no-capture` |
+| 4 | **Train / backtest / reports** (weekly or when ready) | *4 - Learn* | `uv run python scripts/anj.py learn` |
+| 5 | **Research: P1 index study** (offline, read-only) | *5 - Index study* | `uv run python -m apps.anjaneeya_engine.run --mode index-study` |
+
+**What step 5 answers:** *does the NIFTY signal separate forward returns at all?* It
+reads `index_history` only — the 2 years of daily bars plus the stored 1-minute
+series — and tests regime, composite-score band, distance to the previous session's
+high/low, and time of day against forward returns at 5/10/15/30 minutes and 1/2/5/10
+days. Windows are sampled so they never overlap, thin buckets are refused, and the
+headline verdict counts cells that survive a correction across the *whole* study.
+It trains nothing and writes nothing but `data/reports/index_study/*.{json,md}` — run
+it before spending sessions on a model; if nothing separates returns, a model on top
+of the same signal will fit noise.
+
+Below the buttons the tab shows the **last pipeline run as a step table** (parsed from
+`data/logs/daily_pipeline_<date>.log`: `[3/8] greeks …` → RUNNING, `-> OK (12.3s)` →
+OK) and a **readiness card**: captured days, the training gate, and how many days are
+left before a walk-forward fold (and therefore a model) can exist.
 
 **Why step 1 cannot be skipped:** the session tops the index up at **09:05**, which
 covers everything up to the *previous* day. The engine builds the day's `nifty_*`
@@ -246,16 +261,18 @@ deliberately rather than as a shortcut.
 ```powershell
 # morning (09:00)
 uv run streamlit run scripts/anj_ui.py            # console
-#   Run -> Morning - browser login + capture      (one click: token + capture)
+#   Token -> Login with browser        (once a day; the token dies at 06:00)
+#   Live  -> Start capture             (waits for 09:15, stops at 15:30)
+#   Live  -> Stop capture              (any time; flushes and exits cleanly)
 #   ...or without the console:
 #   .\.venv\Scripts\python.exe scripts\login_and_start.py
 
 # after the close (15:35)
-#   Run -> Top up index            |  .\.venv\Scripts\python.exe -m apps.anjaneeya_capture.run --mode backfill
-#   Run -> Day - math only         |  .\.venv\Scripts\python.exe scripts\anj.py day --no-capture
+#   Post-close -> 1 - Top up NIFTY index     |  .\.venv\Scripts\python.exe -m apps.anjaneeya_capture.run --mode backfill
+#   Post-close -> 3 - Rebuild the day        |  .\.venv\Scripts\python.exe scripts\anj.py day --no-capture
+#   Post-close -> 4 - Learn                  |  .\.venv\Scripts\python.exe scripts\anj.py learn
+#   Post-close -> 5 - Index study           |  .\.venv\Scripts\python.exe -m apps.anjaneeya_engine.run --mode index-study
 
-# weekly (or when there is enough data)
-uv run python scripts/anj.py learn                # train + backtest + reports
 
 # any time something looks wrong
 uv run python scripts/doctor.py

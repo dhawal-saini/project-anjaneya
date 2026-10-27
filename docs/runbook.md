@@ -514,6 +514,28 @@ It runs these eight steps, in order, fail-fast:
 | 7 | train | `train` | a LightGBM artefact under `data/models/` (see §5) |
 | 8 | backtest | `backtest` | the spec-23 replay ledger + summary under `data/backtests/` |
 
+### The P1 index study (`--mode index-study`)
+
+Before spending sessions on a model, ask whether the signal separates returns at all:
+
+```powershell
+uv run python -m apps.anjaneeya_engine.run --mode index-study           # writes JSON + MD
+uv run python -m apps.anjaneeya_engine.run --mode index-study --dry-run  # plan only
+```
+
+It is read-only over `index_history` (the ~2-year daily series plus the stored 1m
+series), needs no credentials and no network, and writes
+`data/reports/index_study/index_study_<first>_<last>.{json,md}`: regime, composite
+band, distance to the previous session's high/low and time of day, against forward
+returns at 5/10/15/30 minutes and 1/2/5/10 days — with sample sizes, hit rates,
+ATR-normalised means and BH-corrected p-values.
+
+Three rules keep it honest: windows are sampled every *h*-th bar so they do not
+overlap, a bucket below `model.evaluation.preliminary_min_samples` is
+`INSUFFICIENT_SAMPLE` with no p-value, and the headline is the *study-wide* line —
+cells that survive correction across the whole study, not within one small table.
+
+
 Useful flags:
 
 ```powershell

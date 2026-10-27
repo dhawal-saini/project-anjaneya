@@ -281,6 +281,29 @@ def _noop_adapter(config):
     )
 
 
+def test_a_stop_request_file_ends_the_session_cleanly(config) -> None:
+    """The console runs the capture in another process, so it cannot set `stop_event`.
+
+    A flag file beside the heartbeat is the bridge both sides share; it must stop the
+    loop, be consumed (so the next session starts clean) and leave the data intact.
+    """
+    seed_cache(config)
+    clock = FakeClock(OPEN)
+    ticker = FakeTicker()
+    session, logger = make_session(config, clock=clock, client=live_client())
+    session._adapter_factory = lambda: _adapter_for(config, ticker)
+    run_ticks(ticker, clock)
+
+    session.stop_request_path.parent.mkdir(parents=True, exist_ok=True)
+    session.stop_request_path.write_text("stop", encoding="utf-8")
+
+    summary = session.run(smoke_minutes=3)
+
+    assert any("stop requested" in note for note in summary.notes), summary.describe()
+    assert not session.stop_request_path.exists()
+    assert summary.status != "FAILED"
+
+
 def test_a_full_session_captures_ticks_snapshots_and_coverage(config) -> None:
     seed_cache(config)
     clock = FakeClock(OPEN)

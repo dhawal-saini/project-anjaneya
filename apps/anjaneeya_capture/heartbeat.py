@@ -77,6 +77,9 @@ class HeartbeatState:
     largest_gap_seconds: float = 0.0
     subscribed_instruments: int = 0
     atm_strike: float | None = None
+    #: Smoothed ``exchange - received`` in seconds (positive = this PC's clock is
+    #: behind the exchange). Reported for visibility; it never alters a bar.
+    clock_offset_seconds: float | None = None
     expiries: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -108,6 +111,7 @@ class HeartbeatState:
             "largest_gap_seconds": round(self.largest_gap_seconds, 3),
             "subscribed_instruments": self.subscribed_instruments,
             "atm_strike": self.atm_strike,
+            "clock_offset_seconds": self.clock_offset_seconds,
             "expiries": list(self.expiries),
             "notes": list(self.notes),
         }

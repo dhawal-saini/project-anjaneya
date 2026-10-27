@@ -62,6 +62,7 @@ if str(REPO_ROOT) not in sys.path:  # `python scripts/anj_ui.py --run-job ...`
 
 from core.auth import normalise_request_token  # noqa: E402
 from core.config_loader import load_config  # noqa: E402
+from core.env import load_env_file  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # The owners: every button delegates to one of these, never to its own logic.
@@ -71,6 +72,7 @@ LOGIN = "scripts/daily_login.py"
 LOGIN_AND_START = "scripts/login_and_start.py"
 PIPELINE = "scripts/run_daily_pipeline.py"
 CAPTURE_APP = "apps.anjaneeya_capture.run"
+ENGINE_APP = "apps.anjaneeya_engine.run"
 
 #: ``run_daily_pipeline.STEPS`` + ``WEEKLY_STEPS``, in the order they run.
 PIPELINE_ORDER: tuple[str, ...] = (
@@ -251,6 +253,138 @@ def index_topup_argv(*, common: Sequence[str] = ()) -> list[str]:
     while the engine builds the day's NIFTY block from ``index_history`` alone.
     """
     return ["-m", CAPTURE_APP, "--mode", "backfill", *common]
+
+
+def backfill_options_argv(*, years: float = 0.01, common: Sequence[str] = ()) -> list[str]:
+    """Heal missing *candles* from REST (option means ``years`` of 1m bars).
+
+    Ticks cannot be recovered after the fact; 1-minute bars can, so a session that
+    started late or died mid-day still yields a usable candle series.
+    """
+    return ["-m", CAPTURE_APP, "--mode", "backfill-options", "--years", number(years), *common]
+
+
+def index_study_argv(*, common: Sequence[str] = ()) -> list[str]:
+    """The P1 study: does the NIFTY signal separate forward returns?
+
+    Read-only over ``index_history`` and offline (no credentials, no network), so it
+    is safe to run any evening. It writes a JSON + Markdown pair under
+    ``data/reports/index_study`` and never writes to the database.
+    """
+    return ["-m", ENGINE_APP, "--mode", "index-study", *common]
+
+
+def login_now_argv(*, common: Sequence[str] = (), timeout: int = 240) -> list[str]:
+    """Browser login only (``--no-start``): the session is started separately."""
+    return [LOGIN_AND_START, "--timeout", str(int(timeout)), "--no-start", *common]
+
+
+# ---------------------------------------------------------------------------
+# Files the console reads *while* a job runs (the database is locked then).
+# ---------------------------------------------------------------------------
+def heartbeat_path(data_root: str | Path) -> Path:
+    """The capture heartbeat the Live tab renders (rewritten every 10 s)."""
+    return Path(data_root) / "runs" / "heartbeat" / "capture.json"
+
+
+def stop_request_path(data_root: str | Path) -> Path:
+    """The flag file a running session polls; it is consumed when honoured."""
+    return Path(data_root) / "runs" / "heartbeat" / "stop.request"
+
+
+def read_heartbeat(data_root: str | Path) -> dict[str, Any] | None:
+    """The last heartbeat payload, or ``None`` when absent / unreadable."""
+    try:
+        payload = json.loads(heartbeat_path(data_root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def request_stop(data_root: str | Path) -> Path:
+    """Ask a running session to stop, without touching the database."""
+    path = stop_request_path(data_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    return path
+
+
+def heartbeat_age(payload: dict[str, Any] | None, *, now: datetime | None = None) -> float | None:
+    """Seconds since a heartbeat payload was written (``None`` when unreadable)."""
+    if not payload:
+        return None
+    stamp = payload.get("written_at")
+    if not isinstance(stamp, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    reference = now or datetime.now(moment.tzinfo)
+    return max(0.0, (reference - moment).total_seconds())
+
+
+def stop_requested(data_root: str | Path) -> bool:
+    """True while a stop request is still waiting to be honoured."""
+    return stop_request_path(data_root).exists()
+
+
+_STEP_LINE = re.compile(r"^\[(\d+)/(\d+)\]\s+([a-z_]+):\s*(.*)$")
+_RESULT_LINE = re.compile(r"^->\s+([A-Z_]+)(?:\s+\(([\d.]+)s\))?")
+
+
+def parse_pipeline_log(text: str) -> list[dict[str, Any]]:
+    """Turn a ``run_daily_pipeline`` log into ``[{step, summary, status, seconds}]``.
+
+    The pipeline prints ``[3/8] candles: ticks -> candles + the coverage ledger`` when
+    a step starts and ``-> OK (12.3s)`` when it finishes, so the console can show the
+    evening chain live without the pipeline having to publish anything new.
+    """
+    steps: list[dict[str, Any]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        started = _STEP_LINE.match(line)
+        if started:
+            steps.append(
+                {
+                    "position": int(started.group(1)),
+                    "total": int(started.group(2)),
+                    "step": started.group(3),
+                    "summary": started.group(4).strip(),
+                    "status": "running",
+                    "seconds": None,
+                }
+            )
+            continue
+        finished = _RESULT_LINE.match(line)
+        if finished and steps:
+            steps[-1]["status"] = finished.group(1).lower()
+            seconds = finished.group(2)
+            steps[-1]["seconds"] = float(seconds) if seconds else None
+    return steps
+
+
+def newest_file(root: str | Path, pattern: str) -> Path | None:
+    """The newest path matching ``pattern`` under ``root``, or ``None``."""
+    matches = sorted(Path(root).glob(pattern), key=_mtime, reverse=True)
+    return matches[0] if matches else None
+
+
+def read_accumulation(data_root: str | Path) -> dict[str, Any] | None:
+    """The newest ``--mode accumulation`` JSON, if one has been written."""
+    path = newest_file(Path(data_root) / "reports" / "accumulation", "*_accumulation.json")
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def newest_model(data_root: str | Path) -> Path | None:
+    """The newest model artefact, if a model has been trained yet."""
+    return newest_file(Path(data_root) / "models", "*.txt")
 
 
 def mask(value: str | None) -> str:
@@ -707,6 +841,14 @@ def render_job_panel(st, *, data_root: Path) -> None:
         st.rerun()
 
 
+def totp_available() -> bool:
+    """True when user id, password and TOTP secret are all set (``.env`` included)."""
+    return all(
+        os.environ.get(name)
+        for name in ("ZERODHA_USER_ID", "ZERODHA_PASSWORD", "ZERODHA_TOTP_KEY")
+    )
+
+
 def token_tab(st, config, *, common: Sequence[str], data_root: Path) -> None:
     """Today's token: is it alive, and the two ways to replace it."""
     summary = token_summary(config)
@@ -733,18 +875,20 @@ def token_tab(st, config, *, common: Sequence[str], data_root: Path) -> None:
         st.warning("No cached token yet. Kite expires one every morning, so `day` needs a login first.")
 
     st.divider()
-    columns = st.columns(2)
-    if columns[0].button("Refresh token (TOTP)", type="primary", key="token-totp"):
-        launch(st, "token", login_argv(common=common), data_root=data_root)
-    if columns[1].button("Force re-login", key="token-force"):
-        launch(st, "token-force", login_argv(force=True, common=common), data_root=data_root)
+    st.subheader("Get a fresh token")
     st.caption(
-        "The TOTP login reads `ZERODHA_USER_ID`, `ZERODHA_PASSWORD` and "
-        "`ZERODHA_TOTP_KEY` from `.env` - the console never asks for them, so they never "
-        "pass through a browser. Without a TOTP key, use the request_token box below."
+        "Kite expires the access token every morning (~06:00 IST), so this is a daily step. "
+        "The console never asks for your password - the login is completed on Kite's own page."
+    )
+    if st.button("Login with browser (recommended)", type="primary", key="token-browser"):
+        launch(st, "token-browser", login_now_argv(common=common), data_root=data_root)
+    st.caption(
+        "Opens the Kite login on this machine, catches the `request_token` on "
+        "`127.0.0.1:5000`, then caches and verifies the token. Finish the password + 2FA "
+        "within 4 minutes."
     )
 
-    with st.expander("Kite blocked the TOTP login? Exchange a request_token instead"):
+    with st.expander("Kite blocked the browser login? Paste the request_token instead"):
         pasted = st.text_input(
             "request_token or the redirect URL",
             type="password",
@@ -761,6 +905,109 @@ def token_tab(st, config, *, common: Sequence[str], data_root: Path) -> None:
                 st.success(f"Token stored; expires {detail.get('expires_at')}.")
             else:
                 st.error(f"The exchange failed (exit {detail.get('exit_code')}): {detail.get('detail')}")
+
+    st.divider()
+    if totp_available():
+        columns = st.columns(2)
+        if columns[0].button("Refresh token (TOTP)", key="token-totp"):
+            launch(st, "token", login_argv(common=common), data_root=data_root)
+        if columns[1].button("Force re-login (TOTP)", key="token-force"):
+            launch(st, "token-force", login_argv(force=True, common=common), data_root=data_root)
+        st.caption(
+            "TOTP login reads `ZERODHA_USER_ID`, `ZERODHA_PASSWORD` and `ZERODHA_TOTP_KEY` "
+            "from `.env`, so it needs no browser."
+        )
+    else:
+        st.caption(
+            "TOTP login is unavailable (`ZERODHA_TOTP_KEY` is not set), so those buttons are "
+            "hidden: a button that cannot work is worse than no button."
+        )
+
+
+def _render_live_body(st, *, data_root: Path) -> None:
+    """The live card: what the heartbeat publishes, re-rendered every 5 s."""
+    payload = read_heartbeat(data_root)
+    if payload is None:
+        st.info("No capture heartbeat yet - no session has run on this machine.")
+        return
+
+    status = str(payload.get("status") or "?").upper()
+    age = heartbeat_age(payload)
+    if status == "RUNNING" and age is not None and age <= 90:
+        st.success(f"Capturing - heartbeat {age:.0f}s old")
+    elif status == "RUNNING":
+        st.error(
+            f"Session says RUNNING but the heartbeat is {age:.0f}s old"
+            if age is not None
+            else "Session says RUNNING but the heartbeat cannot be read"
+        )
+    else:
+        st.info(f"Session {status} (last heartbeat {age:.0f}s ago)" if age is not None else f"Session {status}")
+
+    first, second, third = st.columns(3)
+    first.metric("Ticks", f"{int(payload.get('ticks_total') or 0):,}")
+    first.metric("Ticks / minute", f"{float(payload.get('ticks_per_minute') or 0):,.0f}")
+    second.metric("Snapshots", f"{int(payload.get('snapshots_total') or 0):,}")
+    second.metric("Subscribed", f"{int(payload.get('subscribed_instruments') or 0):,}")
+    third.metric("ATM strike", f"{payload.get('atm_strike') or '-'}")
+    third.metric("Newest price", f"{payload.get('newest_price') or '-'}")
+
+    offset = payload.get("clock_offset_seconds")
+    st.table(
+        [
+            {"field": "connected", "value": str(bool(payload.get("connected")))},
+            {"field": "last tick", "value": str(payload.get("last_tick_at") or "-")},
+            {"field": "newest tick", "value": str(payload.get("newest_tick_timestamp") or "-")},
+            {"field": "clock offset (s)", "value": "-" if offset is None else f"{float(offset):+.2f}"},
+            {
+                "field": "polls / failures",
+                "value": f"{int(payload.get('poll_count') or 0)} / {int(payload.get('poll_failures') or 0)}",
+            },
+            {"field": "gaps", "value": str(payload.get("gap_count") or 0)},
+            {"field": "reconnects", "value": str(payload.get("reconnects") or 0)},
+            {"field": "buffered rows", "value": str(payload.get("buffered_rows") or 0)},
+            {"field": "expiries", "value": ", ".join(payload.get("expiries") or []) or "-"},
+            {"field": "run id", "value": str(payload.get("run_id") or "-")},
+        ]
+    )
+    if offset is not None and abs(float(offset)) >= 1.0:
+        st.caption(
+            f"Exchange time is {float(offset):+.1f}s from this PC's clock. Bars are stamped "
+            "with the **exchange** timestamp; this number is informational only."
+        )
+    for note in (payload.get("notes") or [])[-4:]:
+        st.warning(str(note))
+
+
+def live_tab(st, *, common: Sequence[str], data_root: Path) -> None:
+    """Start or stop a capture, and watch it happen without touching the database."""
+    st.subheader("Live capture")
+    actions = st.columns(3)
+    if actions[0].button("Start capture (browser login)", type="primary", key="live-start"):
+        launch(st, "morning", morning_argv(common=common), data_root=data_root)
+    if actions[1].button("Stop capture", key="live-stop"):
+        path = request_stop(data_root)
+        st.warning(
+            f"Stop requested (`{path.name}`). The session finishes its current cycle, flushes "
+            "and shuts down; everything already captured is kept."
+        )
+    if actions[2].button("Refresh now", key="live-refresh"):
+        st.rerun()
+    if stop_requested(data_root):
+        st.info("A stop request is waiting for the session to notice it (checked every cycle).")
+    st.caption(
+        "Start = browser login, then `--mode capture` (waits for 09:15, stops at 15:30). "
+        "The card below refreshes itself from `runs/heartbeat/capture.json`, so it keeps "
+        "working while the capture holds the database."
+    )
+
+    st.divider()
+    st.fragment(run_every="5s")(lambda: _render_live_body(st, data_root=data_root))()
+
+    st.divider()
+    job = read_status(status_file(data_root))
+    st.caption(f"Job log tail - {getattr(job, 'name', 'no job')} ({getattr(job, 'state', '-')})")
+    st.code(read_log(getattr(job, "log_path", None), max_bytes=4000) or "(no job log yet)", language="text")
 
 
 def history_tab(st, *, common: Sequence[str], data_root: Path) -> None:
@@ -794,6 +1041,134 @@ def history_tab(st, *, common: Sequence[str], data_root: Path) -> None:
         "A backfill is network-bound and can run for a while; it survives closing this page, "
         "and the sidebar shows the command it is still running."
     )
+
+
+_PIPELINE_LABELS = {
+    "ok": "OK",
+    "running": "RUNNING",
+    "failed": "FAILED",
+    "skipped": "SKIPPED",
+    "gate": "GATE",
+    "dry_run": "DRY RUN",
+}
+
+
+def _render_pipeline_steps(st, *, data_root: Path) -> None:
+    """The evening chain, read from the pipeline's own dated log."""
+    st.subheader("Last post-close run")
+    path = newest_file(Path(data_root) / "logs", "daily_pipeline_*.log")
+    if path is None:
+        st.info("No pipeline log yet - press 3 or 4 above.")
+        return
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        st.error(f"Could not read {path.name}: {exc}")
+        return
+    steps = parse_pipeline_log(text)
+    st.caption(f"`{path.name}` - {len(steps)} step(s) announced")
+    if not steps:
+        st.info("The log has no step lines yet.")
+        return
+    st.table(
+        [
+            {
+                "step": f"{item['position']}/{item['total']} {item['step']}",
+                "status": _PIPELINE_LABELS.get(str(item["status"]), str(item["status"]).upper()),
+                "seconds": "-" if item["seconds"] is None else f"{item['seconds']:.1f}",
+                "what": item["summary"],
+            }
+            for item in steps
+        ]
+    )
+
+
+def _render_readiness(st, config, *, data_root: Path) -> None:
+    """How far the accumulation is from a model (files only, no database)."""
+    st.subheader("Readiness")
+    document = read_accumulation(data_root) or {}
+    captured = document.get("captured_days")
+    gates = (document.get("gate") or {}).get("gates") or {}
+    gate_days = gates.get("ml_training_min_days") or config.model.data_gates.ml_training_min_days
+    walk = config.model.walk_forward
+    fold_days = walk.holdout_days + walk.train_window_days + walk.validate_window_days
+    model = newest_model(data_root)
+
+    columns = st.columns(4)
+    columns[0].metric("Captured days", captured if captured is not None else "-")
+    columns[1].metric("Train gate", gate_days)
+    columns[2].metric("First fold", fold_days)
+    columns[3].metric(
+        "Days to first fold", max(0, fold_days - captured) if isinstance(captured, int) else "-"
+    )
+    st.caption(
+        f"Newest model: {model.name if model else 'none yet'}. A walk-forward fold needs "
+        f"{fold_days} captured days (holdout {walk.holdout_days} + train "
+        f"{walk.train_window_days} + validate {walk.validate_window_days}); `--force` skips the "
+        "gate but cannot create a fold."
+    )
+    if not document:
+        st.info("No accumulation report yet - step 4 (Learn) writes one.")
+
+
+def postclose_tab(st, config, *, common: Sequence[str], data_root: Path) -> None:
+    """Everything after 15:30, in the order that works."""
+    st.subheader("After the close")
+    st.caption(
+        "Order matters: the index top-up feeds the rebuild, and the rebuild feeds training. "
+        "One command per button, one job at a time."
+    )
+    row = st.columns(2)
+    if row[0].button("1 - Top up NIFTY index (network, seconds)", key="post-topup"):
+        launch(st, "index-topup", index_topup_argv(common=common), data_root=data_root)
+    if row[1].button("2 - Heal candles from REST (network)", key="post-heal"):
+        launch(st, "backfill-options", backfill_options_argv(common=common), data_root=data_root)
+    row = st.columns(2)
+    if row[0].button("3 - Rebuild the day (math only)", key="post-rebuild"):
+        launch(st, "day-no-capture", day_argv(no_capture=True, common=common), data_root=data_root)
+    if row[1].button("4 - Learn: dataset, train, backtest, reports", type="primary", key="post-learn"):
+        launch(st, "learn", learn_argv({}, common=common), data_root=data_root)
+    st.caption(
+        "`Learn` forwards `--weekly`, so it also writes report / explain / importance / charts / "
+        "accumulation. Training exits 4 below the accumulation gate - that is the gate, not a bug."
+    )
+
+    st.divider()
+    st.subheader("Research: P1 - is the signal worth building a model on?")
+    st.caption(
+        "Forward-return study over the stored NIFTY index alone: regime, composite band, "
+        "distance to the previous session's high/low, and time of day. Read-only and offline. "
+        "It answers *before* training whether the signal separates returns at all - no model, "
+        "no advice, and every table carries its sample size and corrected p-value."
+    )
+    if st.button(
+        "5 - Index study (P1: forward returns, no model)",
+        key="post-index-study",
+    ):
+        launch(st, "index-study", index_study_argv(common=common), data_root=data_root)
+
+    with st.expander("The exact commands behind these buttons"):
+        st.code(
+            "\n".join(
+                " ".join(argv)
+                for argv in (
+                    index_topup_argv(common=common),
+                    backfill_options_argv(common=common),
+                    day_argv(no_capture=True, common=common),
+                    learn_argv({}, common=common),
+                    index_study_argv(common=common),
+                )
+            ),
+            language="powershell",
+        )
+
+    st.divider()
+    _render_pipeline_steps(st, data_root=data_root)
+    st.divider()
+    _render_readiness(st, config, data_root=data_root)
+    st.divider()
+    with st.expander("First-time setup - full history backfill (run once)"):
+        history_tab(st, common=common, data_root=data_root)
 
 
 def data_tab(st, config, *, data_root: Path) -> None:
@@ -962,6 +1337,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     st.sidebar.header("Configuration")
     config_dir = st.sidebar.text_input("Config directory (blank = ./config)", value="", key="config-dir")
+    # `.env` is loaded so the page can say whether the TOTP login is even possible -
+    # a button that cannot work is worse than no button. Nothing is ever rendered.
+    load_env_file(config_dir=Path(config_dir) if config_dir else None)
     try:
         config = load_config(config_dir=Path(config_dir) if config_dir else None)
     except Exception as exc:
@@ -977,17 +1355,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         st.info(flash)
     render_job_panel(st, data_root=data_root)
 
-    token_tab_view, history_view, data_view, run_view, results_view, playbook_view = st.tabs(
-        ["Token", "History", "Data", "Run", "Results", "Playbook"]
+    token_view, live_view, postclose_view, data_view, results_view, playbook_view = st.tabs(
+        ["Token", "Live", "Post-close", "Data", "Results", "Playbook"]
     )
-    with token_tab_view:
+    with token_view:
         token_tab(st, config, common=common, data_root=data_root)
-    with history_view:
-        history_tab(st, common=common, data_root=data_root)
+    with live_view:
+        live_tab(st, common=common, data_root=data_root)
+    with postclose_view:
+        postclose_tab(st, config, common=common, data_root=data_root)
     with data_view:
         data_tab(st, config, data_root=data_root)
-    with run_view:
-        run_tab(st, common=common, data_root=data_root)
     with results_view:
         results_tab(st, data_root=data_root)
     with playbook_view:

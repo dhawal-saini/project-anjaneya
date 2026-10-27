@@ -104,6 +104,12 @@ from core.options import (
     build_selection,
     template_pattern,
 )
+from core.research.index_study import (
+    IndexStudyPolicy,
+    build_index_study,
+    render_study_markdown,
+    write_index_study,
+)
 from core.schemas import CoverageRow, QualityFlag
 from core.storage import (
     SchemaVersionError,
@@ -2507,6 +2513,77 @@ def _run_status(context: AppContext, *, as_json: bool) -> int:
     return finalize_run(context, status="SUCCESS", exit_code=EXIT_OK)
 
 
+def _run_index_study(context: AppContext, args: argparse.Namespace) -> int:
+    """``--mode index-study``: does the NIFTY signal separate forward returns?
+
+    Read-only over ``index_history``: it trains nothing, writes no database row, and
+    lands a JSON + Markdown pair under ``data/reports/index_study``.
+    """
+    if not context.db_path.exists():
+        print(
+            f"ANJANEYA-ENGINE: no DuckDB database at {context.db_path}; there is no index "
+            "history to study yet.",
+            file=sys.stderr,
+        )
+        return finalize_run(context, status="NO_DATA", exit_code=EXIT_OK)
+
+    policy = IndexStudyPolicy.from_config(context.config)
+    connection = connect(context.db_path, read_only=True)
+    try:
+        study = build_index_study(
+            connection,
+            symbol=_underlying_symbol(context),
+            config=context.config,
+            policy=policy,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported like every other mode
+        context.logger.exception("index study failed")
+        print(
+            f"ANJANEYA-ENGINE index-study failed: {type(exc).__name__}: {exc}", file=sys.stderr
+        )
+        return finalize_run(context, status="FAILED", exit_code=EXIT_FAILED)
+    finally:
+        connection.close()
+
+    payload = study.to_dict()
+    daily = payload["daily"]
+    intraday = payload["intraday"]
+    if context.dry_run:
+        print(
+            f"ANJANEYA-ENGINE dry-run: index-study -> {study.symbol} "
+            f"({study.first} .. {study.last})"
+        )
+        print(f"  daily    : {daily.get('bars', 0)} bar(s)")
+        print(
+            f"  intraday : {intraday.get('bars', 0)} bar(s) over "
+            f"{intraday.get('sessions', 0)} session(s)"
+        )
+        print(
+            f"  horizons : {list(policy.intraday_horizons)} (intraday) / "
+            f"{list(policy.daily_horizons)} (daily)"
+        )
+        print("  dry-run reads only; no study is written")
+        return finalize_run(context, status="SUCCESS", exit_code=EXIT_OK)
+
+    if not daily.get("available") and not intraday.get("available"):
+        print("ANJANEYA-ENGINE: index_history holds no bars to study.", file=sys.stderr)
+        return finalize_run(context, status="NO_DATA", exit_code=EXIT_OK)
+
+    written = write_index_study(study, context.config.data_dir("reports"))
+    for path in written:
+        context.run_context.register_artifact(path)
+        context.logger.info(f"index study written: {path}")
+    if args.as_json:
+        print(json.dumps(payload, indent=2, default=str))
+    else:
+        print(render_study_markdown(study))
+        print("")
+        print("ANJANEYA-ENGINE index study written:")
+        for path in written:
+            print(f"  {path}")
+    return finalize_run(context, status="SUCCESS", exit_code=EXIT_OK)
+
+
 def _run_planned_mode(context: AppContext, mode: str) -> int:
     """Explain that a mode is not implemented yet, and exit with code 3."""
     plan = MODE_PLAN.get(mode, "planned in a later phase")
@@ -2537,6 +2614,8 @@ def _dispatch(context: AppContext, args: argparse.Namespace) -> int:
         return _run_build_labels(context, args)
     if context.mode == "validate":
         return _run_validate(context, args)
+    if context.mode == "index-study":
+        return _run_index_study(context, args)
     if context.dry_run:
         plan = MODE_PLAN.get(context.mode, "planned in a later phase")
         context.logger.info(f"dry-run: would execute {context.mode!r} -> {plan}")

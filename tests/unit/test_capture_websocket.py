@@ -184,23 +184,31 @@ def test_a_tick_without_an_exchange_timestamp_falls_back_to_receive_time(metadat
     assert result.suspect == 1
 
 
-def test_a_future_exchange_timestamp_is_flagged_not_dropped(metadata) -> None:
-    """A machine clock behind the exchange must not cost us data."""
-    result = ticks_to_rows(
-        [
-            make_tick(
-                token=OPTION_TOKEN, last_price=123.0, exchange_timestamp=TS + timedelta(seconds=30)
-            )
-        ],
-        metadata=metadata,
-        run_id=RUN_ID,
-        received_at=TS,
-        machine_tz=IST,
+def test_a_future_exchange_timestamp_is_recorded_not_dropped(metadata) -> None:
+    """A machine clock behind the exchange must not cost us data.
+
+    The default policy (``trust="exchange"``) keeps the tick ``OK`` and stamps it with
+    the exchange time - a slow PC clock is not bad data. The strict policy still
+    flags it, which is what ``trust="machine"`` is for; both keep the row.
+    """
+    tick = make_tick(
+        token=OPTION_TOKEN, last_price=123.0, exchange_timestamp=TS + timedelta(seconds=30)
     )
-    row = result.rows[0]
-    assert row.timestamp == TS + timedelta(seconds=30)
-    assert row.fetch_timestamp >= row.timestamp
-    assert row.quality_flag is QualityFlag.SUSPECT
+    common = {
+        "metadata": metadata,
+        "run_id": RUN_ID,
+        "received_at": TS,
+        "machine_tz": IST,
+    }
+
+    trusted = ticks_to_rows([tick], **common).rows[0]
+    assert trusted.timestamp == TS + timedelta(seconds=30)
+    assert trusted.fetch_timestamp >= trusted.timestamp
+    assert trusted.quality_flag is QualityFlag.OK
+
+    strict = ticks_to_rows([tick], **common, trust="machine", tolerance_seconds=2.0).rows[0]
+    assert strict.timestamp == TS + timedelta(seconds=30)
+    assert strict.quality_flag is QualityFlag.SUSPECT
 
 
 def test_out_of_session_ticks_are_recorded_with_a_flag(metadata) -> None:
@@ -271,6 +279,64 @@ def test_ltp_mode_ticks_carry_no_oi_or_volume(metadata) -> None:
     assert row.last_price == 99.0
     assert row.oi is None and row.volume_traded is None
     assert row.quality_flag is QualityFlag.SUSPECT  # ltp mode carries no exchange time
+
+
+def test_a_lagging_machine_clock_no_longer_flags_a_good_tick(metadata) -> None:
+    """2026-10-27: the PC clock sat ~18 s behind, so ~93% of good ticks were flagged.
+
+    The tick carries its own exchange timestamp, and with the default
+    ``trust="exchange"`` that is what defines the bar - the machine clock is only a
+    fallback for ticks that carry no exchange time at all.
+    """
+    behind = TS - timedelta(seconds=18)  # the local receive clock, 18 s slow
+
+    result = ticks_to_rows(
+        [make_tick(token=OPTION_TOKEN, last_price=123.0, exchange_timestamp=TS)],
+        metadata=metadata,
+        run_id=RUN_ID,
+        received_at=behind,
+        machine_tz=IST,
+    )
+
+    row = result.rows[0]
+    assert row.quality_flag is QualityFlag.OK
+    assert row.timestamp == TS  # the exchange time, not the receive time
+    assert result.clock_offset_seconds == pytest.approx(18.0)
+
+
+def test_the_strict_machine_rule_is_still_available(metadata) -> None:
+    """``trust="machine"`` keeps the old behaviour for anyone who wants it."""
+    behind = TS - timedelta(seconds=18)
+
+    result = ticks_to_rows(
+        [make_tick(token=OPTION_TOKEN, last_price=123.0, exchange_timestamp=TS)],
+        metadata=metadata,
+        run_id=RUN_ID,
+        received_at=behind,
+        machine_tz=IST,
+        trust="machine",
+        tolerance_seconds=2.0,
+    )
+
+    assert result.rows[0].quality_flag is QualityFlag.SUSPECT
+
+
+def test_a_tick_with_no_exchange_time_is_suspect_under_either_trust(metadata) -> None:
+    tick = make_tick(token=OPTION_TOKEN, last_price=123.0)
+    tick.pop("exchange_timestamp", None)
+    tick.pop("last_trade_time", None)
+
+    for trust in ("exchange", "machine"):
+        result = ticks_to_rows(
+            [tick],
+            metadata=metadata,
+            run_id=RUN_ID,
+            received_at=TS,
+            machine_tz=IST,
+            trust=trust,
+        )
+        assert result.rows[0].quality_flag is QualityFlag.SUSPECT, trust
+        assert result.rows[0].timestamp == TS
 
 
 # ---------------------------------------------------------------------------

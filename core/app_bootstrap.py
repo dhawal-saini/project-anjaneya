@@ -75,6 +75,7 @@ DEFAULT_MODES: dict[str, tuple[str, ...]] = {
         "build-features",
         "build-labels",
         "validate",
+        "index-study",
         "status",
     ),
     APP_AI: (

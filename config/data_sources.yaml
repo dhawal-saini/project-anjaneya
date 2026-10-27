@@ -80,6 +80,19 @@ zerodha:
     # socket, not a quiet market.
     stall_timeout_seconds: 60
 
+    # --- which clock defines a bar -----------------------------------------
+    # `exchange` (default): the exchange timestamp is the truth; the local clock is
+    #   used only when a tick carries no exchange time at all. A drifting PC clock
+    #   therefore cannot mark good ticks SUSPECT.
+    # `machine`: the older, stricter rule - flag a tick when its exchange stamp is
+    #   more than `tolerance_seconds` ahead of the local receive time.
+    clock_skew:
+      trust: exchange
+      tolerance_seconds: 2.0
+      # Publish the measured offset (exchange - received) in the heartbeat, so a
+      # drifting clock is visible without being written into the data.
+      report_offset: true
+
   # --- option chain polling (OI / IV snapshots) ---
   option_chain:
     interval_seconds: 60

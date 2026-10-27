@@ -50,7 +50,8 @@ behaviour is repeatable under realistic Indian transaction costs.
 Capture modes are **gated on real credentials**: without a Kite session they stop
 with `exit 2` and an actionable message instead of pretending to record anything.
 `--mode build-candles`, `--mode enrich-greeks`, `--mode universe`,
-`--mode build-features`, `--mode build-labels` and `--mode validate` (engine) and
+`--mode build-features`, `--mode build-labels`, `--mode validate` and
+`--mode index-study` (engine) and
 `--mode dataset` / `--mode train` / `--mode backtest` / `--mode report` /
 `--mode explain` / `--mode importance` / `--mode charts` / `--mode accumulation` /
 `--mode decide` (AI) need **no

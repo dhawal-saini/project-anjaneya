@@ -341,6 +341,27 @@ class RetryConfig(_StrictConfigModel):
     retry_on_status: list[int] = Field(default_factory=lambda: [429, 500, 502, 503, 504])
 
 
+class ClockSkewConfig(_StrictConfigModel):
+    """How a tick's exchange timestamp is judged against the local clock.
+
+    ``trust: exchange`` (the default) treats the exchange timestamp as the truth and
+    uses the local clock only when a tick carries no exchange time at all. That is
+    the correct rule for a machine whose clock drifts: the flag exists to catch bad
+    *data*, and a slow PC clock is not bad data. On 2026-10-27 one such machine
+    stored 899,915 ticks flagged ``SUSPECT`` that all carried valid exchange stamps.
+
+    ``trust: machine`` restores the strict rule - a tick whose exchange stamp is more
+    than ``tolerance_seconds`` ahead of the local receive time is ``SUSPECT``.
+
+    ``report_offset`` publishes the measured ``exchange - received`` offset in the
+    heartbeat, so a drifting clock stays visible without being written into the data.
+    """
+
+    trust: Literal["exchange", "machine"] = "exchange"
+    tolerance_seconds: float = Field(default=2.0, ge=0)
+    report_offset: bool = True
+
+
 class WebsocketConfig(_StrictConfigModel):
     """KiteTicker connection budget (spec 4.4/4.6).
 
@@ -361,6 +382,8 @@ class WebsocketConfig(_StrictConfigModel):
     #: exponential backoff, we only bound the number of attempts.
     max_reconnect_attempts: int = Field(default=50, ge=0)
     stall_timeout_seconds: float = Field(default=60.0, gt=0)
+    #: Exchange time is authoritative; see :class:`ClockSkewConfig`.
+    clock_skew: ClockSkewConfig = Field(default_factory=ClockSkewConfig)
 
     @model_validator(mode="after")
     def _check_backoff(self) -> WebsocketConfig:
