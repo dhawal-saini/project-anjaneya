@@ -23,6 +23,7 @@ from core.auth.zerodha_auth import (
     exchange_request_token,
     extract_request_token,
     login_with_totp,
+    normalise_request_token,
     resolve_access_token,
 )
 
@@ -134,6 +135,29 @@ def test_extract_request_token_fails_loudly() -> None:
         extract_request_token("https://kite.trade/?status=error")
     with pytest.raises(AuthenticationError, match="request_token"):
         extract_request_token(None)
+
+
+@pytest.mark.parametrize(
+    "text,token",
+    [
+        ("abc123XYZ", "abc123XYZ"),
+        ("  tok_9  ", "tok_9"),
+        ("https://127.0.0.1:5000/?request_token=abc123XYZ&action=login&status=success", "abc123XYZ"),
+        ("request_token=plain", "plain"),
+    ],
+)
+def test_normalise_request_token_accepts_a_bare_value_or_a_url(text: str, token: str) -> None:
+    """A human pastes either form; both are the same single-use secret."""
+    assert normalise_request_token(text) == token
+
+
+def test_normalise_request_token_refuses_a_blank_value() -> None:
+    with pytest.raises(AuthenticationError, match="empty request_token"):
+        normalise_request_token("")
+    with pytest.raises(AuthenticationError, match="empty request_token"):
+        normalise_request_token("   ")
+    with pytest.raises(AuthenticationError, match="empty request_token"):
+        normalise_request_token(None)
 
 
 # ---------------------------------------------------------------------------

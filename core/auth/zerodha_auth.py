@@ -52,6 +52,7 @@ __all__ = [
     "exchange_request_token",
     "extract_request_token",
     "login_with_totp",
+    "normalise_request_token",
     "resolve_access_token",
 ]
 
@@ -219,6 +220,25 @@ def extract_request_token(text: str | None) -> str:
             f"Could not find request_token in the login response: {snippet!r}"
         )
     return match.group(1)
+
+
+def normalise_request_token(text: str | None) -> str:
+    """Accept **either** a bare ``request_token`` or a redirect URL / Location header.
+
+    :func:`extract_request_token` insists on the ``request_token=`` parameter, which
+    is right for a redirect but wrong for a human: the console's paste box and
+    ``daily_login.py --request-token`` are given whatever was copied out of the
+    browser - sometimes just the value, sometimes the whole URL. Both are the same
+    secret, and a token is single-use and short-lived, so refusing one of the two
+    forms only wastes a login.
+
+    Nothing is invented: a blank value is still an error, and a bare value is used
+    verbatim (Kite itself decides whether it is valid).
+    """
+    if not text or not text.strip():
+        raise AuthenticationError("An empty request_token cannot be exchanged")
+    match = _REQUEST_TOKEN_PATTERN.search(text)
+    return match.group(1) if match else text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +538,7 @@ def resolve_access_token(
     if request_token:
         token = exchange_request_token(
             creds,
-            request_token,
+            normalise_request_token(request_token),
             timezone_name=timezone_name,
             validity_cutoff=validity_cutoff,
             obtained_via="cli_request_token",

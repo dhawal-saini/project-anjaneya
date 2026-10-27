@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -296,9 +297,15 @@ def test_a_full_session_captures_ticks_snapshots_and_coverage(config) -> None:
     assert summary.writer["ticks"] == summary.stream["ticks"]
     assert summary.coverage_rows > 0
     assert summary.universe is not None and summary.universe["atm_strike"] == 25000.0
-    # The index top-up is attempted (one request for the last 10 days of minutes)
-    # but the fake provider returns no candles.
-    assert summary.backfill["requests"] == 1
+    # The index top-up is attempted but the fake provider returns no candles. How
+    # many requests it plans follows `topup_days` and the provider's per-request
+    # ceiling, so derive it instead of hard-coding a number that a config change
+    # (10 -> 60 days) silently breaks.
+    topup = config.option_universe.index_history
+    per_request = config.data_sources.zerodha.capture.historical.max_days_per_request[
+        topup.topup_interval
+    ]
+    assert summary.backfill["requests"] == math.ceil(topup.topup_days / per_request)
     assert summary.backfill["rows"] == 0
     assert summary.backfill["failures"] == []
     assert "session result: SUCCESS" in summary.render()

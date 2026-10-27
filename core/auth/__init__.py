@@ -24,6 +24,7 @@ from core.auth.zerodha_auth import (
     exchange_request_token,
     extract_request_token,
     login_with_totp,
+    normalise_request_token,
     resolve_access_token,
 )
 from core.auth.zerodha_client import (
@@ -48,6 +49,7 @@ __all__ = [
     "extract_request_token",
     "login_url",
     "login_with_totp",
+    "normalise_request_token",
     "obtain_request_token",
     "parse_redirect_url",
     "resolve_access_token",

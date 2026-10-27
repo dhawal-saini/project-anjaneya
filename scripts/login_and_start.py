@@ -53,7 +53,7 @@ from core.auth import (  # noqa: E402
     AuthenticationError,
     TokenStore,
     ZerodhaCredentials,
-    extract_request_token,
+    normalise_request_token,
     obtain_request_token,
 )
 from core.auth.browser_login import DEFAULT_REDIRECT_URL  # noqa: E402
@@ -219,7 +219,7 @@ def _obtain_token(args: argparse.Namespace, api_key: str, redirect_url: str) -> 
     """Return ``(request_token, login_label)``, from the browser or by pasting."""
     if args.paste:
         print("Paste the full redirect URL (or just the request_token) and press Enter:")
-        return extract_request_token(sys.stdin.readline()), "pasted request_token"
+        return normalise_request_token(sys.stdin.readline()), "pasted request_token"
     token = obtain_request_token(
         api_key,
         redirect_url=redirect_url,

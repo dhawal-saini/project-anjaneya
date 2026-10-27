@@ -229,6 +229,36 @@ def test_poll_once_requests_every_symbol_and_stores_snapshots(
     assert len(poller.totals.rows) == len(result.rows)
 
 
+def test_the_poller_calls_the_client_the_way_zerodha_client_defines_it(
+    config, metadata, symbols_by_token
+) -> None:
+    """``ZerodhaClient.quote(instruments)`` takes ONE sequence - never varargs.
+
+    The poller called ``quote(*batch)`` against that wrapper, so every poll in
+    production failed with "quote() takes 2 positional arguments but 21 were given"
+    while this file stayed green - its shared double was written against the
+    *SDK's* varargs form instead. This double is deliberately strict, so the
+    calling convention itself is pinned.
+    """
+
+    class StrictKite:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def quote(self, instruments):
+            self.calls.append(list(instruments))
+            return {}
+
+    client = StrictKite()
+    poller = make_poller(config, metadata, symbols_by_token, client=client)
+
+    result = poller.poll_once()
+
+    assert result.failures == []
+    assert len(client.calls) == 1
+    assert sorted(client.calls[0]) == sorted(poller.symbols)
+
+
 def test_a_missing_symbol_is_reported_but_the_rest_are_stored(
     config, metadata, symbols_by_token
 ) -> None:

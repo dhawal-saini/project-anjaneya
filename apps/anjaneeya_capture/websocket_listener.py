@@ -27,6 +27,7 @@ Importing this module performs no I/O and does not import ``kiteconnect``.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -114,13 +115,22 @@ class ContractMeta:
 
     @classmethod
     def from_instrument(cls, instrument: Instrument) -> ContractMeta:
-        """Build metadata from a resolved instrument."""
+        """Build metadata from a resolved instrument.
+
+        Kite's dump reports ``strike = 0`` for index and futures rows, and a futures
+        row carries an expiry while having no option type. Copying those through
+        verbatim makes the row contract see a *partial* option identity
+        ("must carry expiry, strike and option_type together") and **reject every
+        index and futures tick**. A non-option is therefore normalised here to
+        "no expiry, no strike, no option type", which is what it actually is.
+        """
+        is_option = instrument.option_type is not None
         return cls(
             instrument_token=instrument.instrument_token,
             tradingsymbol=instrument.tradingsymbol,
             exchange=instrument.exchange,
-            expiry=instrument.expiry,
-            strike=instrument.strike,
+            expiry=instrument.expiry if is_option else None,
+            strike=instrument.strike if is_option else None,
             option_type=instrument.option_type,
             lot_size=instrument.lot_size,
             tick_size=instrument.tick_size,
@@ -515,11 +525,29 @@ class TickStream:
         self._last_connect_at: datetime | None = None
         self._backoff_seconds = websocket_config.reconnect_initial_seconds
         self._stopped = False
+        #: Set by :meth:`handle_connect`; :meth:`start` waits on it before returning,
+        #: because ``KiteTicker.connect(threaded=True)`` returns before the socket is
+        #: open and ``subscribe()`` dereferences it.
+        self._connected_event = threading.Event()
+        self._pending_tokens: tuple[int, ...] = ()
+        self._subscribe_error: Exception | None = None
 
     # -- lifecycle ----------------------------------------------------------
     def start(self, tokens: Sequence[int]) -> None:
-        """Create the adapter, register callbacks, connect and subscribe."""
+        """Create the adapter, register callbacks, connect, and subscribe once live.
+
+        ``KiteTicker.connect(threaded=True)`` returns **before** the socket is open,
+        and subscribing then dereferences ``self.ws`` while it is still ``None``
+        (``AttributeError: 'NoneType' object has no attribute 'sendMessage'``), so no
+        token is ever requested and the session streams nothing. The subscription is
+        therefore issued from :meth:`handle_connect` - the SDK's own "connection is
+        live" callback - and this method only waits for that moment, bounded by
+        ``websocket.connect_timeout_seconds``.
+        """
         self._stopped = False
+        self._pending_tokens = tuple(int(token) for token in tokens)
+        self._subscribe_error = None
+        self._connected_event.clear()
         self.adapter = self._adapter_factory()
         self.adapter.set_callbacks(
             on_ticks=self.handle_ticks,
@@ -532,11 +560,21 @@ class TickStream:
         )
         self.adapter.connect()
         self._last_connect_at = self._clock()
-        self.subscribe(tokens)
+        timeout = float(getattr(self.config, "connect_timeout_seconds", 30.0) or 30.0)
+        if not self._connected_event.wait(timeout=timeout):
+            raise RuntimeError(
+                f"the websocket did not connect within {timeout:g}s; nothing was subscribed"
+            )
+        if self._subscribe_error is not None:
+            raise RuntimeError(
+                f"the websocket connected but the subscription failed: {self._subscribe_error}"
+            ) from self._subscribe_error
 
     def stop(self) -> None:
         """Close the socket (idempotent)."""
         self._stopped = True
+        self._pending_tokens = ()
+        self._connected_event.clear()
         if self.adapter is not None:
             self.adapter.close()
         self.connected = False
@@ -731,6 +769,18 @@ class TickStream:
             self.heartbeat.update(connected=True)
         if self.logger is not None:
             self.logger.info(f"websocket connected (mode {self.mode!r})")
+        # Subscribe here - and only once - because this callback is the first moment
+        # `subscribe()` is safe. After a reconnect the SDK replays `subscribed_tokens`
+        # itself, so a second call would duplicate every message; `self.subscribed` is
+        # what tells the two cases apart.
+        if self._pending_tokens and not self.subscribed:
+            try:
+                self.subscribe(self._pending_tokens)
+            except Exception as exc:  # noqa: BLE001 - reported to start(), never swallowed
+                self._subscribe_error = exc
+                if self.logger is not None:
+                    self.logger.error(f"initial subscribe failed: {exc}")
+        self._connected_event.set()
 
     def handle_close(self, ws: Any = None, reason: Any = None) -> None:
         """The socket closed; the SDK will reconnect on its own."""

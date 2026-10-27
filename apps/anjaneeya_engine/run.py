@@ -188,6 +188,15 @@ def _configure_engine_parser(parser: argparse.ArgumentParser) -> None:
         help="validate: how many bars to recompute from a truncated window for the no-look-ahead "
         "check (0 skips it). Recomputing a bar costs about as much as building it.",
     )
+    parser.add_argument(
+        "--quality",
+        default="OK",
+        metavar="OK,SUSPECT",
+        help="build-candles: which tick quality flags may shape a bar. Default: OK. "
+        "Pass OK,SUSPECT for a day whose ticks were flagged because the *machine* clock "
+        "was behind the exchange (the tick's own exchange timestamp is still what is "
+        "used). The flags actually used are printed by every run.",
+    )
 
 
 
@@ -323,6 +332,28 @@ class DayResult:
         }
 
 
+def _quality_flags(value: str | None) -> tuple[QualityFlag, ...]:
+    """Parse ``--quality`` into the flags allowed to shape a bar.
+
+    The default is ``OK``. ``OK,SUSPECT`` exists because a tick can carry a perfectly
+    good **exchange** timestamp and still be flagged: the listener marks a tick
+    SUSPECT when ``exchange_time - received_at > 2s``, which means the *machine*
+    clock is behind the exchange, not that the tick is wrong. Building such a day
+    with the default drops almost all of it (2026-10-27: 899,915 suspect against
+    66,049 OK), so the choice is explicit - and every run prints the flags it used.
+    """
+    wanted = [part.strip().upper() for part in str(value or "OK").split(",") if part.strip()]
+    if not wanted:
+        return (QualityFlag.OK,)
+    valid = {flag.name: flag for flag in QualityFlag}
+    unknown = [name for name in wanted if name not in valid]
+    if unknown:
+        raise ConfigError(
+            f"--quality: unknown flag(s) {unknown}; expected any of {sorted(valid)}"
+        )
+    return tuple(valid[name] for name in dict.fromkeys(wanted))
+
+
 def _build_day(
     context: AppContext,
     *,
@@ -331,6 +362,7 @@ def _build_day(
     day: date,
     timeframes: Sequence[str],
     symbols: Sequence[str] | None,
+    quality_flags: Sequence[QualityFlag] = (QualityFlag.OK,),
 ) -> DayResult:
     """Build and store every timeframe of every contract for one trading day."""
     result = DayResult(day=day, status="SUCCESS")
@@ -352,12 +384,14 @@ def _build_day(
     result.excluded = {
         flag: count
         for flag, count in quality_counts(connection, start=start, end=end, symbols=requested).items()
-        if flag != QualityFlag.OK.value
+        if flag not in {quality.value for quality in quality_flags}
     }
 
     coverage_rows: list[Any] = []
     for symbol in contracts:
-        frame = read_ticks(connection, start=start, end=end, symbols=[symbol])
+        frame = read_ticks(
+            connection, start=start, end=end, symbols=[symbol], quality_flags=quality_flags
+        )
         if frame.empty:
             # Every tick of this contract was flagged, or the contract only
             # appeared in another session: no bars, and an explicit MISSING_TICK
@@ -437,10 +471,12 @@ def _plan_lines(
     days: Sequence[date],
     timeframes: Sequence[str],
     symbols: Sequence[str] | None,
+    quality_flags: Sequence[QualityFlag] = (QualityFlag.OK,),
 ) -> list[str]:
     """Dry-run plan: what *would* be built, and how big a complete day is."""
     lines = [f"ANJANEYA-ENGINE dry-run: build-candles -> {len(days)} day(s)"]
     lines.append(f"  timeframes    : {', '.join(timeframes)}")
+    lines.append(f"  tick quality  : {','.join(flag.value for flag in quality_flags)} (flags allowed to shape a bar)")
     lines.append(
         "  contracts     : "
         + (", ".join(symbols) if symbols else "every contract with ticks in the session")
@@ -471,14 +507,17 @@ def _render_build_summary(
     timeframes: Sequence[str],
     stats: CandleWriteStats,
     as_json: bool,
+    quality_flags: Sequence[QualityFlag] = (QualityFlag.OK,),
 ) -> str:
     """Render the run summary as JSON or as an operator-friendly block."""
     failures = [message for result in results for message in result.failures]
+    quality = [flag.value for flag in quality_flags]
     if as_json:
         return json.dumps(
             {
                 "mode": "build-candles",
                 "timeframes": list(timeframes),
+                "quality_flags": quality,
                 "days": [result.to_dict() for result in results],
                 "candles_written": stats.candles,
                 "candles_replaced": stats.deleted,
@@ -493,6 +532,7 @@ def _render_build_summary(
 
     lines = [f"ANJANEYA-ENGINE build-candles - {len(results)} day(s)"]
     lines.append(f"  timeframes      : {', '.join(timeframes)}")
+    lines.append(f"  tick quality    : {','.join(quality)}")
     for result in results:
         bars = ", ".join(f"{name}={count}" for name, count in result.bars.items()) or "no bars"
         lines.append(
@@ -529,6 +569,7 @@ def _run_build_candles(context: AppContext, args: argparse.Namespace) -> int:
     """``--mode build-candles``: ticks -> 1m/3m/5m/15m bars, coverage, mirror."""
     timeframes = _resolve_timeframes(context, getattr(args, "timeframes", None))
     symbols = getattr(args, "symbols", None)
+    quality_flags = _quality_flags(getattr(args, "quality", "OK"))
     if not context.db_path.exists():
         print(
             f"ANJANEYA-ENGINE: no DuckDB database at {context.db_path}; there is nothing to "
@@ -560,6 +601,7 @@ def _run_build_candles(context: AppContext, args: argparse.Namespace) -> int:
                         days=days,
                         timeframes=timeframes,
                         symbols=symbols,
+                        quality_flags=quality_flags,
                     )
                 )
             )
@@ -580,6 +622,7 @@ def _run_build_candles(context: AppContext, args: argparse.Namespace) -> int:
                     day=day,
                     timeframes=timeframes,
                     symbols=symbols,
+                    quality_flags=quality_flags,
                 )
                 for day in days
             ]
@@ -589,6 +632,7 @@ def _run_build_candles(context: AppContext, args: argparse.Namespace) -> int:
                     timeframes=timeframes,
                     stats=writer.stats,
                     as_json=args.as_json,
+                    quality_flags=quality_flags,
                 )
             )
             if any(result.failures for result in results):
@@ -694,6 +738,7 @@ class FeatureDayResult:
     expected_rows: int = 0
     missing_rows: int = 0
     contracts_without_candles: int = 0
+    non_option_contracts: int = 0
     index_rows: int = 0
     coverage: dict[str, int] = field(default_factory=dict)
     parquet: list[str] = field(default_factory=list)
@@ -710,6 +755,7 @@ class FeatureDayResult:
             "expected_rows": self.expected_rows,
             "missing_rows": self.missing_rows,
             "contracts_without_candles": self.contracts_without_candles,
+            "non_option_contracts": self.non_option_contracts,
             "index_rows": self.index_rows,
             "coverage": self.coverage,
             "parquet": self.parquet,
@@ -757,6 +803,21 @@ def _feature_coverage_row(
     return row.model_copy(update={"note": note})
 
 
+def _contracts_for_session(
+    connection: Any, *, start: datetime, end: datetime, timeframe: str
+) -> list[str]:
+    """Which contracts a feature build covers for one session.
+
+    Ticks are the live record, so they win. A day that has **only** candles - the
+    option history that ``--mode backfill-options`` seeds from REST, which never
+    stores ticks - still has everything the feature builder reads, so answering
+    "nothing to build" for a day the caller named explicitly would be wrong.
+    """
+    return symbols_with_ticks(connection, start=start, end=end) or symbols_with_candles(
+        connection, start=start, end=end, timeframes=[timeframe]
+    )
+
+
 def _build_feature_day(
     context: AppContext,
     *,
@@ -782,7 +843,9 @@ def _build_feature_day(
     contracts = (
         list(symbols)
         if symbols
-        else symbols_with_ticks(connection, start=session_start, end=session_end)
+        else _contracts_for_session(
+            connection, start=session_start, end=session_end, timeframe=timeframe
+        )
     )
     result.contracts = len(contracts)
     if not contracts:
@@ -825,6 +888,18 @@ def _build_feature_day(
                 f"{day.isoformat()} {symbol}: no {timeframe} candles in the session; run "
                 "--mode build-candles first"
             )
+            continue
+        if "option_type" not in frame.columns or frame["option_type"].notna().sum() == 0:
+            # A reference instrument (``NIFTY 50``, the future) has no expiry/strike/
+            # option type. The builder compares those with calendar dates, which raised
+            # `TypeError: Cannot compare NaT with datetime.date` and cost the whole
+            # day; the index reaches the features through ``index_history`` instead.
+            result.non_option_contracts += 1
+            context.logger.info(
+                f"{day.isoformat()} {symbol}: not an option contract (no expiry/strike/option "
+                "type); nothing to feature"
+            )
+            result.missing_rows += session_bars
             continue
         try:
             features = build_feature_frame(
@@ -927,7 +1002,11 @@ def _feature_plan_lines(
         count = (
             len(symbols)
             if symbols
-            else len(symbols_with_ticks(connection, start=session_start, end=session_end))
+            else len(
+                _contracts_for_session(
+                    connection, start=session_start, end=session_end, timeframe=timeframe
+                )
+            )
         )
         index_frame = _index_frame(
             context, connection, start=window_start, end=session_end, timeframe=timeframe
@@ -985,6 +1064,11 @@ def _render_feature_summary(
             lines.append(
                 f"      no candles  : {result.contracts_without_candles} contract(s) "
                 "(run --mode build-candles first)"
+            )
+        if result.non_option_contracts:
+            lines.append(
+                f"      not options : {result.non_option_contracts} contract(s) skipped "
+                "(index/future: the index reaches features through index_history)"
             )
         lines.append(f"      NIFTY index : {result.index_rows} bar(s)")
         if result.coverage:

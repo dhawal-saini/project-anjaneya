@@ -84,7 +84,10 @@ index_history:
   # room to spare. Override a single run with `--mode backfill --years N`.
   backfill_days: 730
   # Daily top-up: re-fetch the last N days to heal any gap.
-  topup_days: 10
+  # Raised 10 -> 60 so the engine has a 1-minute NIFTY series across the whole
+  # ~60-day option window; the feature builder reads `index_history` only, and a
+  # day without it gets NULL `nifty_*` columns.
+  topup_days: 60
   # `backfill_interval: day` builds the long research history; the intraday
   # interval is topped up in the same run so the live session has context.
   # Both are Kite intervals (see core.constants.HISTORICAL_INTERVALS).

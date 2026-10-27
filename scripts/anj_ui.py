@@ -60,6 +60,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:  # `python scripts/anj_ui.py --run-job ...`
     sys.path.insert(0, str(REPO_ROOT))
 
+from core.auth import normalise_request_token  # noqa: E402
 from core.config_loader import load_config  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -67,7 +68,9 @@ from core.config_loader import load_config  # noqa: E402
 # ---------------------------------------------------------------------------
 FACADE = "scripts/anj.py"
 LOGIN = "scripts/daily_login.py"
+LOGIN_AND_START = "scripts/login_and_start.py"
 PIPELINE = "scripts/run_daily_pipeline.py"
+CAPTURE_APP = "apps.anjaneeya_capture.run"
 
 #: ``run_daily_pipeline.STEPS`` + ``WEEKLY_STEPS``, in the order they run.
 PIPELINE_ORDER: tuple[str, ...] = (
@@ -227,6 +230,29 @@ def login_argv(*, force: bool = False, common: Sequence[str] = ()) -> list[str]:
     return [*argv, *common]
 
 
+def morning_argv(*, common: Sequence[str] = (), timeout: int = 240) -> list[str]:
+    """The whole morning in one job: browser login, token exchange, capture.
+
+    ``login_and_start.py`` opens the Kite login, catches the ``request_token`` on
+    the loopback redirect URL, exchanges and verifies it, and only then starts
+    ``--mode capture``. So a no-TOTP operator never pastes a token, and the capture
+    can never start on a dead token. A usable cached token skips the browser.
+    """
+    return [LOGIN_AND_START, "--timeout", str(int(timeout)), *common]
+
+
+def index_topup_argv(*, common: Sequence[str] = ()) -> list[str]:
+    """The after-close index top-up: NIFTY daily history plus ``topup_days`` of 1m.
+
+    ``--mode backfill`` is the capture app's index-history mode. It is *not* the
+    overnight ``history`` chain: no instrument dump is re-downloaded and no option
+    contracts are fetched, so it is a handful of requests and finishes in seconds.
+    It matters because the session tops up at 09:05 (i.e. up to the previous day),
+    while the engine builds the day's NIFTY block from ``index_history`` alone.
+    """
+    return ["-m", CAPTURE_APP, "--mode", "backfill", *common]
+
+
 def mask(value: str | None) -> str:
     """Everything but the last four characters, for anything secret-shaped."""
     if not value:
@@ -262,10 +288,56 @@ class JobStatus:
     finished_at: str | None = None
     exit_code: int | None = None
     log_path: str | None = None
+    pid: int | None = None
 
     @property
     def active(self) -> bool:
-        return self.state in {"starting", "running"}
+        """True while the recorded child process is actually alive.
+
+        A status file can outlive its process: a crash, a killed console, a reboot
+        mid-job. Trusting ``state`` alone then leaves a permanent lock that refuses
+        every button - which is exactly what happened on 2026-10-27, when an
+        orphaned 'token-force' card blocked the whole morning. Liveness is part of
+        the answer, and a status file with no pid is treated as not active.
+        """
+        return self.state in {"starting", "running"} and pid_alive(self.pid)
+
+
+def pid_alive(pid: int | None) -> bool:
+    """True when ``pid`` is a live process on this machine.
+
+    ``os.kill(pid, 0)`` is deliberately **not** used on Windows: there a zero
+    signal is not a probe, it terminates the process. ``OpenProcess`` +
+    ``GetExitCodeProcess`` is the read-only equivalent.
+    """
+    if not pid or int(pid) <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(int(pid), 0)
+        except OSError:
+            return False
+        return True
+    import ctypes  # noqa: PLC0415 - Windows-only, imported where it is used
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def now() -> str:
@@ -309,6 +381,7 @@ def read_status(path: Path) -> JobStatus | None:
         finished_at=payload.get("finished_at"),
         exit_code=payload.get("exit_code"),
         log_path=payload.get("log_path"),
+        pid=payload.get("pid"),
     )
 
 
@@ -352,18 +425,33 @@ def start_job(
         f"=== {name} | {status.started_at} ===\n$ {' '.join(argv)}\n",
         encoding="utf-8",
     )
-    detached: dict[str, Any] = (
-        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS}
-        if os.name == "nt"
-        else {"start_new_session": True}
-    )
-    spawn(
-        [sys.executable, str(Path(__file__).resolve()), "--run-job", str(path), "--", *argv],
-        cwd=str(cwd),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        **detached,
-    )
+    command = [sys.executable, str(Path(__file__).resolve()), "--run-job", str(path), "--", *argv]
+    common: dict[str, Any] = {
+        "cwd": str(cwd),
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        # A *real* console, just invisible. DETACHED_PROCESS leaves the child with no
+        # console at all, and on 2026-10-27 every such job died with
+        # STATUS_CONTROL_C_EXIT (0xC000013A) seconds after starting - while the
+        # status file stayed 'running' and blocked the console. A hidden console
+        # keeps console control events behaving the way subprocess expects.
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        process = spawn(
+            command,
+            **common,
+            creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP,
+            startupinfo=startupinfo,
+        )
+    else:
+        process = spawn(command, **common, start_new_session=True)
+    pid = getattr(process, "pid", None)
+    if pid:
+        status = replace(status, pid=int(pid))
+        write_status(path, status)
     return status
 
 
@@ -537,7 +625,7 @@ def exchange_request_token(config, request_token: str, *, common: Sequence[str] 
     script prints are returned.
     """
     completed = subprocess.run(
-        [sys.executable, LOGIN, "--json", "--request-token", request_token, *common],
+        [sys.executable, LOGIN, "--json", "--request-token", normalise_request_token(request_token), *common],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -651,16 +739,19 @@ def token_tab(st, config, *, common: Sequence[str], data_root: Path) -> None:
     if columns[1].button("Force re-login", key="token-force"):
         launch(st, "token-force", login_argv(force=True, common=common), data_root=data_root)
     st.caption(
-        "The TOTP login reads `KITE_API_KEY`, `KITE_API_SECRET` and `ZERODHA_TOTP_KEY` from "
-        "`.env` - the console never asks for them, so they never pass through a browser."
+        "The TOTP login reads `ZERODHA_USER_ID`, `ZERODHA_PASSWORD` and "
+        "`ZERODHA_TOTP_KEY` from `.env` - the console never asks for them, so they never "
+        "pass through a browser. Without a TOTP key, use the request_token box below."
     )
 
     with st.expander("Kite blocked the TOTP login? Exchange a request_token instead"):
         pasted = st.text_input(
-            "request_token (from the redirect URL)",
+            "request_token or the redirect URL",
             type="password",
             key="request-token",
-            help="One use only. Exchanged here, never written to a log or a status file.",
+            help="One use only, and it expires in a couple of minutes. Paste the bare token "
+            "or the whole http://127.0.0.1:<port>/?request_token=... URL - both work. "
+            "Exchanged here, never written to a log or a status file.",
         )
         if st.button("Exchange request token", disabled=not pasted, key="token-exchange"):
             with st.spinner("Talking to Kite..."):
@@ -752,6 +843,18 @@ def run_tab(st, *, common: Sequence[str], data_root: Path) -> None:
             st.markdown(f"**{name}** - {reason}")
 
     st.divider()
+    st.subheader("Morning: login + capture (one click at 09:00)")
+    st.caption(
+        "Opens the Kite login on this machine, catches the `request_token` on "
+        "`127.0.0.1:5000`, exchanges and verifies it, then starts the capture (waits for "
+        "09:15, stops at 15:30). If today's token is already cached and valid the browser "
+        "is skipped and the capture starts immediately. Finish the password + 2FA within "
+        "4 minutes, or the job fails cleanly and **nothing is captured**."
+    )
+    if st.button("Morning - browser login + capture", type="primary", key="run-morning"):
+        launch(st, "morning", morning_argv(common=common), data_root=data_root)
+
+    st.divider()
     st.subheader("Daily loop")
     st.caption(
         "`anj.py day` always skips `train,backtest`: a model trained before the close is a "
@@ -762,6 +865,17 @@ def run_tab(st, *, common: Sequence[str], data_root: Path) -> None:
         launch(st, "day", day_argv(common=common), data_root=data_root)
     if columns[1].button("Day - math only (holiday, or after the fact)", key="run-day-nocap"):
         launch(st, "day-no-capture", day_argv(no_capture=True, common=common), data_root=data_root)
+
+    st.divider()
+    st.subheader("Post-close: index top-up")
+    st.caption(
+        "The session tops the NIFTY index up at 09:05 - i.e. up to the **previous** day - and "
+        "the engine builds the day's `nifty_*` block from `index_history` alone. After the "
+        "close, run this **first**, then press **Day - math only** above to rebuild the day "
+        "with its NIFTY context. Skipping it leaves that day's `nifty_*` columns NULL."
+    )
+    if st.button("Top up index - NIFTY daily + 1m (network, seconds)", key="run-index-topup"):
+        launch(st, "index-topup", index_topup_argv(common=common), data_root=data_root)
 
     st.divider()
     st.subheader("Evening run")
@@ -776,9 +890,13 @@ def run_tab(st, *, common: Sequence[str], data_root: Path) -> None:
 
     with st.expander("The exact commands behind these buttons"):
         st.code(
-            " ".join(day_argv(common=common))
+            " ".join(morning_argv(common=common))
+            + "\n"
+            + " ".join(day_argv(common=common))
             + "\n"
             + " ".join(day_argv(no_capture=True, common=common))
+            + "\n"
+            + " ".join(index_topup_argv(common=common))
             + "\n"
             + " ".join(learn_argv(switches, force=force, common=common)),
             language="powershell",
@@ -805,6 +923,26 @@ def results_tab(st, *, data_root: Path) -> None:
             st.info("No chart has been written yet; the `charts` step produces them.")
         for path in images:
             st.image(str(path), caption=path.name, width="stretch")
+
+
+#: The operator routine, rendered in the console. One source: the file below.
+PLAYBOOK = REPO_ROOT / "docs" / "daily-playbook.md"
+
+
+def playbook_tab(st) -> None:
+    """The daily routine, straight from ``docs/daily-playbook.md``.
+
+    The document is the source of truth - the console only renders it - so the
+    instructions an operator reads here cannot drift from the ones in the repo.
+    """
+    st.subheader("Daily playbook")
+    try:
+        text = PLAYBOOK.read_text(encoding="utf-8")
+    except OSError as exc:
+        st.error(f"Could not read {PLAYBOOK}: {exc}")
+        return
+    st.markdown(text)
+    st.caption(f"Source: `{PLAYBOOK.relative_to(REPO_ROOT).as_posix()}` - edit that file, not this page.")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -839,8 +977,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         st.info(flash)
     render_job_panel(st, data_root=data_root)
 
-    token_tab_view, history_view, data_view, run_view, results_view = st.tabs(
-        ["Token", "History", "Data", "Run", "Results"]
+    token_tab_view, history_view, data_view, run_view, results_view, playbook_view = st.tabs(
+        ["Token", "History", "Data", "Run", "Results", "Playbook"]
     )
     with token_tab_view:
         token_tab(st, config, common=common, data_root=data_root)
@@ -852,6 +990,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_tab(st, common=common, data_root=data_root)
     with results_view:
         results_tab(st, data_root=data_root)
+    with playbook_view:
+        playbook_tab(st)
     return 0
 
 

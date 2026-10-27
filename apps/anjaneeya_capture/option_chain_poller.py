@@ -320,7 +320,7 @@ class OptionChainPoller:
         for batch in batches:
             result.requests += 1
             try:
-                quotes = self.client.quote(*batch) or {}
+                quotes = self.client.quote(batch) or {}
             except Exception as exc:  # noqa: BLE001 - one bad request must not end the poll
                 self.failures += 1
                 failure = f"quote({len(batch)} symbols): {type(exc).__name__}: {exc}"

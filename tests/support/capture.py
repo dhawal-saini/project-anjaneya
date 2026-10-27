@@ -263,9 +263,28 @@ class FakeKite:
             return [row for rows in self.dump.values() for row in rows]
         return list(self.dump.get(exchange, []))
 
-    def quote(self, *symbols: str) -> dict[str, dict[str, Any]]:
-        self.quote_calls.append(list(symbols))
-        return {symbol: self.quotes[symbol] for symbol in symbols if symbol in self.quotes}
+    def quote(self, *symbols: Any) -> dict[str, dict[str, Any]]:
+        """Quotes for ``symbols``.
+
+        Accepts **both** calling conventions, because two different real objects are
+        stood in for here:
+
+        * ``KiteConnect.quote(*instruments)`` - the SDK, used by the session/capture
+          paths;
+        * ``ZerodhaClient.quote(instruments)`` - the project's wrapper (a single
+          sequence), which is what ``OptionChainPoller`` is given.
+
+        *Tolerant on purpose*: the poller used to call ``quote(*batch)`` against the
+        wrapper and every poll failed in production while these tests passed, because
+        the double only matched the SDK form. A double that accepts both cannot hide
+        that class of mismatch again - the strict regression test lives next to the
+        poller tests.
+        """
+        requested = (
+            list(symbols[0]) if len(symbols) == 1 and not isinstance(symbols[0], str) else list(symbols)
+        )
+        self.quote_calls.append(requested)
+        return {symbol: self.quotes[symbol] for symbol in requested if symbol in self.quotes}
 
     def ltp(self, *symbols: str) -> dict[str, dict[str, Any]]:
         self.ltp_calls.append(list(symbols))

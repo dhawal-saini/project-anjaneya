@@ -30,8 +30,11 @@ class Spawner:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], dict[str, object]]] = []
 
-    def __call__(self, argv: list[str], **kwargs: object) -> None:
+    def __call__(self, argv: list[str], **kwargs: object) -> object:
         self.calls.append(([str(item) for item in argv], kwargs))
+        # ``subprocess.Popen`` returns an object with a ``pid``; the console records it
+        # to tell a live job from a status file whose process is gone.
+        return SimpleNamespace(pid=os.getpid())
 
     @property
     def only(self) -> list[str]:
@@ -159,6 +162,36 @@ def test_login_argv_never_carries_a_secret() -> None:
     assert "--request-token" not in anj_ui.login_argv()
 
 
+def test_morning_is_the_browser_login_owner_and_carries_no_secret() -> None:
+    """One click at 09:00: `login_and_start.py` logs in, then captures.
+
+    The console never handles the password or the request_token - the child opens
+    the browser and catches the redirect itself.
+    """
+    argv = anj_ui.morning_argv()
+    assert argv[:3] == [anj_ui.LOGIN_AND_START, "--timeout", "240"]
+    assert "--request-token" not in argv
+    assert anj_ui.morning_argv(common=["--config-dir", "cfg"])[-2:] == ["--config-dir", "cfg"]
+
+
+def test_the_post_close_topup_is_the_index_mode_not_the_overnight_history() -> None:
+    """The top-up must stay cheap: index history only, no option contracts."""
+    argv = anj_ui.index_topup_argv()
+    assert argv[:4] == ["-m", anj_ui.CAPTURE_APP, "--mode", "backfill"]
+    assert "history" not in argv
+    assert "--option-years" not in argv
+    assert anj_ui.index_topup_argv(common=["--config-dir", "cfg"])[-2:] == ["--config-dir", "cfg"]
+
+
+def test_the_playbook_exists_where_the_console_reads_it() -> None:
+    """The Playbook tab renders this file; a rename must break a test, not the page."""
+    assert anj_ui.PLAYBOOK.name == "daily-playbook.md"
+    assert anj_ui.PLAYBOOK.exists(), f"missing {anj_ui.PLAYBOOK}"
+    text = anj_ui.PLAYBOOK.read_text(encoding="utf-8")
+    assert "## 1. Morning" in text
+    assert "## 3. After the close" in text
+
+
 def test_mask_hides_all_but_the_last_four() -> None:
     assert anj_ui.mask("abcdefghijkl") == "********ijkl"
     assert anj_ui.mask("abc") == "abc"
@@ -224,6 +257,34 @@ def test_start_job_refuses_a_second_writer(data_root: Path, spawner: Spawner) ->
     with pytest.raises(anj_ui.JobBusy, match="still starting"):
         anj_ui.start_job("second", [anj_ui.FACADE, "day"], data_root=data_root, spawn=spawner)
     assert len(spawner.calls) == 1
+
+
+def test_a_status_file_whose_process_is_gone_does_not_block(
+    data_root: Path, spawner: Spawner
+) -> None:
+    """2026-10-27: an orphaned 'token-force' card refused every button all morning.
+
+    The console restarted while a job was live, the child died without writing a
+    terminal state, and the file said 'running' forever. A pid that no longer exists
+    must mean "not active".
+    """
+    path = anj_ui.status_file(data_root)
+    anj_ui.write_status(
+        path, anj_ui.JobStatus(name="token-force", state="running", pid=999_999_999)
+    )
+    assert anj_ui.read_status(path).active is False
+
+    anj_ui.start_job("day", [anj_ui.FACADE, "day"], data_root=data_root, spawn=spawner)
+    assert len(spawner.calls) == 1
+
+
+def test_liveness_decides_whether_a_status_is_active() -> None:
+    assert anj_ui.pid_alive(os.getpid()) is True
+    assert anj_ui.pid_alive(999_999_999) is False
+    assert anj_ui.pid_alive(None) is False
+    assert anj_ui.JobStatus(name="x", state="running", pid=os.getpid()).active is True
+    assert anj_ui.JobStatus(name="x", state="running", pid=None).active is False
+    assert anj_ui.JobStatus(name="x", state="ok", pid=os.getpid()).active is False
 
 
 def test_start_job_proceeds_once_the_previous_job_finished(data_root: Path, spawner: Spawner) -> None:

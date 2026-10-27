@@ -190,6 +190,48 @@ def test_a_contract_with_only_flagged_ticks_is_covered_not_built(tmp_path, capsy
     ) == [(4,)]
 
 
+def test_a_flagged_contract_is_built_when_the_operator_asks_for_that_flag(tmp_path, capsys) -> None:
+    """2026-10-27 on this machine: 93% of ticks were SUSPECT - not because they were
+    bad, but because the *machine* clock sat behind the exchange
+    (``exchange_time - received_at > 2s``). The tick still carries its exchange
+    timestamp, so an operator must be able to admit those flags explicitly, and the
+    run must say which flags it used.
+    """
+    seed_ticks(
+        db_file(tmp_path),
+        [
+            *(make_tick_row(**tick) for tick in ticks_for_minutes(MINUTES)),
+            *(
+                make_tick_row(**dict(tick, quality_flag="SUSPECT"))
+                for tick in ticks_for_minutes(
+                    MINUTES, symbol=PE_SYMBOL, token=900_002, option_type="PE"
+                )
+            ),
+        ],
+    )
+
+    exit_code = engine_main(cli_args(tmp_path, extra=["--quality", "OK,SUSPECT"]))
+
+    output = capsys.readouterr().out
+    assert exit_code == EXIT_OK
+    assert "tick quality    : OK,SUSPECT" in output
+    assert "excluded" not in output
+    assert query(tmp_path, "SELECT DISTINCT tradingsymbol FROM candles ORDER BY 1") == [
+        (CE_SYMBOL,),
+        (PE_SYMBOL,),
+    ]
+    assert query(
+        tmp_path,
+        f"SELECT count(*) FROM data_coverage WHERE tradingsymbol = '{PE_SYMBOL}' "
+        "AND quality_flag = 'MISSING_TICK'",
+    ) == [(0,)]
+
+
+def test_an_unknown_quality_flag_is_refused_before_anything_is_built(tmp_path) -> None:
+    assert engine_main(cli_args(tmp_path, extra=["--quality", "OK,BANANA"])) == EXIT_CONFIG_ERROR
+    assert query(tmp_path, "SELECT count(*) FROM candles") == [(0,)]
+
+
 def test_a_weekend_date_is_reported_as_no_session_and_writes_nothing(seeded, capsys) -> None:
     exit_code = engine_main(cli_args(seeded, extra=["--date", WEEKEND.isoformat()]))
 
